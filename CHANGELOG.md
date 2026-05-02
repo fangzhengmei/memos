@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.29.0](https://github.com/usememos/memos/compare/v0.28.0...v0.29.0) (2026-05-02)
+
+
+### Features
+
+* **activity-calendar:** aggregate by ViewContext.timeBasis ([8daef1d](https://github.com/usememos/memos/commit/8daef1dc89544512fff78fd64d8216b2babc2e42))
+* add link metadata endpoints ([9c5c604](https://github.com/usememos/memos/commit/9c5c604944428d3f682f35c9d05a87c1d4c3152f))
+* **memo:** create memos on the selected calendar date ([#5925](https://github.com/usememos/memos/issues/5925)) ([ef55013](https://github.com/usememos/memos/commit/ef55013418d68e2d6a24a6d02a0365c1ffff03d7))
+* **notification:** add smtp email settings ([cd4f28a](https://github.com/usememos/memos/commit/cd4f28ae1058a125e245ea0a6eae16aea71b8f9d))
+* render link metadata cards ([0bc5669](https://github.com/usememos/memos/commit/0bc56694b0ca347ab1eb083f62997a22007b763d))
+* **stats:** admin instance resource statistics ([ea0625d](https://github.com/usememos/memos/commit/ea0625da45a419e08158ab4102051f3fe5e59b87))
+* **transcription:** explicit STT settings with provider, model, prompt ([#5926](https://github.com/usememos/memos/issues/5926)) ([238f27d](https://github.com/usememos/memos/commit/238f27dea149492a78a8994470b0aac55fece78d))
+
+
+### Bug Fixes
+
+* **fileserver:** preserve HDR image metadata in thumbnails ([c724232](https://github.com/usememos/memos/commit/c7242324a18962e453e7f2a0309a7c07b358bdbe))
+* **frontend:** use correct url path for memos in sitemap.xml ([#5921](https://github.com/usememos/memos/issues/5921)) ([603781f](https://github.com/usememos/memos/commit/603781f792b2603fbda93146988a64a93c92d760))
+* **markdown:** align list items with checkboxes ([e008b1a](https://github.com/usememos/memos/commit/e008b1a23c77945eff87707eb15578d4d6d74e4c))
+* **security:** enforce attachment ownership on memo updates ([35bf761](https://github.com/usememos/memos/commit/35bf761b8c2c3f155bdc06e9b373b6076116a725))
+* **user:** omit internal settings from list responses ([#5917](https://github.com/usememos/memos/issues/5917)) ([1df3fe7](https://github.com/usememos/memos/commit/1df3fe79559ccf94b6c71e9ffb58e870ed43820d))
+* **web:** sync avatar changes immediately after profile update ([#5903](https://github.com/usememos/memos/issues/5903)) ([328396a](https://github.com/usememos/memos/commit/328396a97f2219592032e8418c383e0ab7edaca6))
+
 ## [0.28.0](https://github.com/usememos/memos/compare/v0.27.1...v0.28.0) (2026-04-27)
 
 
