@@ -204,6 +204,7 @@ if memo.RowStatus == store.Archived {
 - 只有创建者可以查看和操作归档的 memo
 - ListMemos 默认只返回 `NORMAL` 状态的 memo
 - 要查看归档 memo，需显式指定 `state=ARCHIVED`
+- **归档的 memo 无法通过分享链接访问**
 
 ### 3.4 删除 (DeleteMemo)
 
@@ -227,9 +228,42 @@ if memo.RowStatus == store.Archived {
   - 关联的 relations、attachments 会被清理
 - **无法恢复**: 删除后无法找回
 
-## 四、可见性控制机制
+## 四、访问控制机制
 
-### 4.1 ListMemos 过滤逻辑
+Memo 有两种独立的访问路径：**常规 API 访问** 和 **分享链接访问**。
+
+### 4.1 常规 API 访问控制
+
+常规 API 包括 `GetMemo`、`ListMemos`、`ListMemoComments` 等，这些 API 在 ACL 中被标记为公开，但在服务层有可见性过滤。
+
+#### 4.1.1 可见性过滤逻辑
+
+**核心逻辑** - `memo_service.go:349-360`:
+
+```go
+if memo.Visibility != store.Public {
+    user, err := s.fetchCurrentUser(ctx)
+    if err != nil {
+        return nil, status.Errorf(codes.Internal, "failed to get user")
+    }
+    if user == nil {
+        return nil, status.Errorf(codes.Unauthenticated, "user not authenticated")
+    }
+    if memo.Visibility == store.Private && memo.CreatorID != user.ID {
+        return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+    }
+}
+```
+
+#### 4.1.2 访问权限矩阵
+
+| Memo 可见性 | 未登录用户 | 已登录非创建者 | 创建者/管理员 |
+|---|---|---|---|
+| PUBLIC | ✅ 可见 | ✅ 可见 | ✅ 可见 |
+| PROTECTED | ❌ 401 Unauthenticated | ✅ 可见 | ✅ 可见 |
+| PRIVATE | ❌ 401 Unauthenticated | ❌ 403 PermissionDenied | ✅ 可见 |
+
+#### 4.1.3 ListMemos 过滤逻辑
 
 **位置**: `server/router/api/v1/memo_service.go:197-206`
 
@@ -249,42 +283,7 @@ if currentUser == nil {
 }
 ```
 
-**规则总结**:
-
-| 用户身份 | 可见范围 |
-|---|---|
-| 未登录 | 仅 `PUBLIC` |
-| 已登录（查看自己） | 所有可见性 |
-| 已登录（查看他人） | `PUBLIC` + `PROTECTED` |
-
-### 4.2 GetMemo 权限检查
-
-**位置**: `server/router/api/v1/memo_service.go:349-360`
-
-```go
-if memo.Visibility != store.Public {
-    user, err := s.fetchCurrentUser(ctx)
-    if err != nil {
-        return nil, status.Errorf(codes.Internal, "failed to get user")
-    }
-    if user == nil {
-        return nil, status.Errorf(codes.Unauthenticated, "user not authenticated")
-    }
-    if memo.Visibility == store.Private && memo.CreatorID != user.ID {
-        return nil, status.Errorf(codes.PermissionDenied, "permission denied")
-    }
-}
-```
-
-**规则总结**:
-
-| Memo 可见性 | 未登录用户 | 已登录非创建者 | 创建者/管理员 |
-|---|---|---|---|
-| PUBLIC | ✅ 可见 | ✅ 可见 | ✅ 可见 |
-| PROTECTED | ❌ 401 Unauthenticated | ✅ 可见 | ✅ 可见 |
-| PRIVATE | ❌ 401 Unauthenticated | ❌ 403 PermissionDenied | ✅ 可见 |
-
-### 4.3 评论权限检查
+#### 4.1.4 评论权限检查
 
 **位置**: `server/router/api/v1/memo_service.go:641-643`
 
@@ -298,19 +297,105 @@ if relatedMemo.Visibility == store.Private && relatedMemo.CreatorID != user.ID &
 - `PRIVATE` memo: 只有创建者和管理员可以评论
 - `PROTECTED`/`PUBLIC`: 任何已登录用户可以评论
 
-### 4.4 评论列表过滤
+### 4.2 分享链接访问控制
 
-**位置**: `server/router/api/v1/memo_service.go:730-735`
+分享链接是独立于可见性的访问机制，可以绕过常规的可见性限制。
+
+#### 4.2.1 公开端点配置
+
+**位置**: `server/router/api/v1/acl_config.go:38-39`
 
 ```go
-if currentUser == nil {
-    memoFilter = `visibility == "PUBLIC"`
-} else {
-    memoFilter = fmt.Sprintf(`creator_id == %d || visibility in ["PUBLIC", "PROTECTED"]`, currentUser.ID)
+// Memo sharing - share-token endpoints require no authentication
+"/memos.api.v1.MemoService/GetMemoByShare": {},
+```
+
+`GetMemoByShare` 是完全公开的，**无需任何认证**。
+
+#### 4.2.2 GetMemoByShare 实现
+
+**位置**: `server/router/api/v1/memo_share_service.go:151-192`
+
+```go
+// GetMemoByShare resolves a share token to its memo. No authentication required.
+// Returns NOT_FOUND for invalid or expired tokens (no information leakage).
+func (s *APIV1Service) GetMemoByShare(ctx context.Context, request *v1pb.GetMemoByShareRequest) (*v1pb.Memo, error) {
+    ms, err := s.getActiveMemoShare(ctx, request.ShareId)
+    if err != nil {
+        return nil, err
+    }
+
+    memo, err := s.Store.GetMemo(ctx, &store.FindMemo{ID: &ms.MemoID})
+    if err != nil {
+        return nil, status.Errorf(codes.Internal, "failed to get memo")
+    }
+    // Treat archived or missing memos the same as an invalid token — no information leakage.
+    if memo == nil || memo.RowStatus == store.Archived {
+        return nil, status.Errorf(codes.NotFound, "not found")
+    }
+    // ... 后续没有 visibility 检查！
 }
 ```
 
-与 ListMemos 逻辑一致，确保评论也遵循相同的可见性规则。
+**关键特性**:
+- **无需认证**: 任何人持有有效 token 即可访问
+- **绕过可见性**: 不检查 memo 的 `visibility` 字段
+- **唯一限制**: 
+  - Token 必须有效且未过期
+  - Memo 不能是 `ARCHIVED` 状态
+
+#### 4.2.3 分享链接访问矩阵
+
+| Memo 状态 | 任何用户（持有有效 token） |
+|---|---|
+| NORMAL + PUBLIC | ✅ 可见 |
+| NORMAL + PROTECTED | ✅ 可见 |
+| NORMAL + PRIVATE | ✅ 可见 |
+| ARCHIVED + 任意 | ❌ 404 NotFound |
+
+#### 4.2.4 附件的分享链接访问
+
+**位置**: `server/router/fileserver/fileserver.go:665-673`
+
+```go
+// Check share token fallback: allow access if request carries a valid, non-expired share token
+// that was issued for this specific memo. This covers attachment requests made from the shared
+// memo page for private or protected memos.
+if shareToken := (*c).QueryParam("share_token"); shareToken != "" {
+    ms, err := s.Store.GetMemoShare(ctx, &store.FindMemoShare{UID: &shareToken})
+    if err == nil && ms != nil && !isMemoShareExpired(ms) && ms.MemoID == memo.ID {
+        return nil
+    }
+}
+```
+
+**规则**:
+- 附件可以通过 `?share_token=` URL 参数绕过可见性检查
+- 这允许分享链接页面正确显示私有/受保护 memo 的附件
+
+#### 4.2.5 分享链接管理
+
+**创建分享链接** (`CreateMemoShare`):
+- 只能由 memo 创建者或管理员创建
+- 可以设置过期时间（可选）
+- Token 使用 shortuuid 生成（22 字符，122 位熵）
+
+**撤销分享链接** (`DeleteMemoShare`):
+- 只能由 memo 创建者或管理员撤销
+- 撤销后 token 立即失效
+
+**查看分享链接** (`ListMemoShares`):
+- 只能由 memo 创建者或管理员查看
+
+### 4.3 两种访问路径对比
+
+| 特性 | 常规 API 访问 | 分享链接访问 |
+|---|---|---|
+| 认证要求 | 部分需要（依可见性而定） | 无需认证 |
+| 可见性检查 | 严格执行 | **不检查** |
+| 访问范围 | 依可见性和身份而定 | 持有有效 token 即可 |
+| 归档限制 | 仅创建者可见 | **完全无法访问** |
+| 典型用途 | 日常使用、浏览 | 分享给外部用户 |
 
 ## 五、默认可见性配置
 
@@ -352,22 +437,25 @@ useMemoInit({
 });
 ```
 
-**位置**: `web/src/components/MemoEditor/hooks/useMemoInit.ts:44-46`
-
-```ts
-if (defaultVisibility !== undefined) {
-  dispatch(actions.setMetadata({ visibility: defaultVisibility }));
-}
-```
-
 ## 六、状态与可见性组合矩阵
 
-| 状态 | 可见性 | 谁可以看到 | API 查询方式 |
-|---|---|---|---|
-| NORMAL | PUBLIC | 所有人 | 默认 ListMemos |
-| NORMAL | PROTECTED | 已登录用户 | 默认 ListMemos |
-| NORMAL | PRIVATE | 仅创建者 | 默认 ListMemos |
-| ARCHIVED | 任意 | 仅创建者 | `?state=ARCHIVED` |
+### 6.1 常规访问路径
+
+| 状态 | 可见性 | 谁可以看到 |
+|---|---|---|
+| NORMAL | PUBLIC | 所有人（未登录 + 已登录） |
+| NORMAL | PROTECTED | 已登录用户（任意） |
+| NORMAL | PRIVATE | 仅创建者/管理员 |
+| ARCHIVED | 任意 | 仅创建者/管理员 |
+
+### 6.2 分享链接访问路径
+
+| 状态 | 可见性 | 谁可以看到（持有有效 token） |
+|---|---|---|
+| NORMAL | PUBLIC | ✅ 任何人 |
+| NORMAL | PROTECTED | ✅ 任何人 |
+| NORMAL | PRIVATE | ✅ 任何人 |
+| ARCHIVED | 任意 | ❌ 无人（返回 404） |
 
 ## 七、关键代码位置索引
 
@@ -382,5 +470,8 @@ if (defaultVisibility !== undefined) {
 | DeleteMemo | `server/router/api/v1/memo_service.go` | 543-618 |
 | ListMemos 可见性过滤 | `server/router/api/v1/memo_service.go` | 197-206 |
 | GetMemo 权限检查 | `server/router/api/v1/memo_service.go` | 338-360 |
+| GetMemoByShare | `server/router/api/v1/memo_share_service.go` | 151-192 |
+| 分享链接 ACL 配置 | `server/router/api/v1/acl_config.go` | 38-39 |
+| 附件分享 token 检查 | `server/router/fileserver/fileserver.go` | 665-673 |
 | 状态转换函数 | `server/router/api/v1/common.go` | 20-36 |
 | 可见性转换函数 | `server/router/api/v1/memo_service_converter.go` | 350-372 |
