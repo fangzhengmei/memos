@@ -615,300 +615,318 @@ if isMultiMemberMotionGroup(currentGroup) && !allGroupMembersRequested(currentGr
 
 ## 四、多入口鉴权边界差异分析
 
-### 4.1 系统入口架构
+### 4.1 关键证据：路由注册顺序与匹配行为
 
-系统有三个主要的 API 入口，每个入口有不同的鉴权策略：
+**核心问题**：文件访问请求 (`/file/attachments/:uid/:filename`) 到底先命中哪个路由？
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              客户端请求                                      │
-└────────────────────────────────────────────────────────────────────────────┘
-                                      │
-          ┌───────────────────────────┼───────────────────────────┐
-          ▼                           ▼                           ▼
-┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
-│  Connect RPC      │     │  gRPC-Gateway     │     │  HTTP 文件服务    │
-│  (浏览器前端)      │     │  (API 网关)       │     │  (文件下载)        │
-│                   │     │                   │     │                   │
-│  Path:            │     │  Path:            │     │  Path:            │
-│  /memos.api.v1.*  │     │  /api/v1/*        │     │  /file/*          │
-│  /memos.api.v1.*  │     │  /file/*          │     │                   │
-└─────────┬─────────┘     └─────────┬─────────┘     └─────────┬─────────┘
-          │                           │                           │
-          ▼                           ▼                           ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         鉴权策略差异                                          │
-├────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Connect RPC / gRPC-Gateway:                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  1. 网关层中间件检查: IsPublicMethod() 白名单                        │   │
-│  │  2. 不在白名单 → 必须携带有效凭证                                     │   │
-│  │  3. 附件服务不在白名单 → 所有请求必须先认证                           │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  HTTP 文件服务:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  1. 网关层放行（无法确定 RPC 方法名）                                 │   │
-│  │  2. 完全在服务层 checkAttachmentPermission() 中检查                  │   │
-│  │  3. 支持 Share Token 临时访问（API 层不支持）                        │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 入口一：Connect RPC（浏览器前端）
-
-**文件位置**: `server/router/api/v1/v1.go:166`
+#### 证据 1：注册顺序代码 (`server.go:78-93`)
 
 ```go
-// 路径匹配
-connectGroup.Any("/memos.api.v1.*", echo.WrapHandler(http.MaxBytesHandler(connectMux, maxAPIRequestBytes)))
+// =============================================================================
+// 注册顺序 1: HTTP 文件服务（先注册）
+// =============================================================================
+// Register HTTP file server routes BEFORE gRPC-Gateway to ensure proper range request handling for Safari.
+// This uses native HTTP serving (http.ServeContent) instead of gRPC for video/audio files.
+fileServerService := fileserver.NewFileServerService(s.Profile, s.Store, s.Secret)
+fileServerService.RegisterRoutes(echoServer)  // ← 先注册
 
-// 中间件链
-connectInterceptors := connect.WithInterceptors(
-  NewMetadataInterceptor(),
-  NewLoggingInterceptor(logStacktraces),
-  NewRecoveryInterceptor(logStacktraces),
-  NewAuthInterceptor(s.Store, s.Secret),  // 认证拦截器
-)
-```
+// ... RSS 路由 ...
 
-**鉴权逻辑**：`NewAuthInterceptor` 使用 `PublicMethods` 白名单
-
-```go
-// server/router/api/v1/acl_config.go
-var PublicMethods = map[string]struct{}{
-  // Auth 相关
-  "/memos.api.v1.AuthService/SignIn": {},
-  "/memos.api.v1.AuthService/RefreshToken": {},
-  
-  // Instance 相关
-  "/memos.api.v1.InstanceService/GetInstanceProfile": {},
-  "/memos.api.v1.InstanceService/GetInstanceSetting": {},
-  
-  // User 相关（公开资料）
-  "/memos.api.v1.UserService/CreateUser": {},
-  "/memos.api.v1.UserService/GetUser": {},
-  "/memos.api.v1.UserService/GetUserAvatar": {},
-  
-  // Memo 相关（可见性在服务层过滤）
-  "/memos.api.v1.MemoService/GetMemo": {},
-  "/memos.api.v1.MemoService/ListMemos": {},
-  "/memos.api.v1.MemoService/GetMemoByShare": {},
-  
-  // 注意: AttachmentService 的方法不在此列表中！
+// =============================================================================
+// 注册顺序 2: gRPC-Gateway（后注册）
+// =============================================================================
+// Register gRPC gateway as api v1 (includes SSE endpoint on CORS-enabled group).
+if err := apiV1Service.RegisterGateway(ctx, echoServer); err != nil {
+    return nil, errors.Wrap(err, "failed to register gRPC gateway")
 }
+
+// =============================================================================
+// 注册顺序 3: Connect RPC（最后注册）
+// =============================================================================
+// Connect handlers for browser clients (replaces grpc-web).
+connectGroup.Any("/memos.api.v1.*", ...)
 ```
 
-**关键结论**：
-- `AttachmentService` 的所有方法（`GetAttachment`, `CreateAttachment`, `DeleteAttachment` 等）**不在白名单中**
-- 所有附件 API 请求**必须携带有效认证凭证**才能通过网关层
-- 未认证请求会直接返回 `16 Unauthenticated`
+**代码注释明确说明**：文件服务路由**在 gRPC-Gateway 之前**注册，目的是确保 Safari 浏览器的 Range 请求能正常处理（使用原生 `http.ServeContent`）。
 
-### 4.3 入口二：gRPC-Gateway（API 网关）
+#### 证据 2：各路由的注册内容
 
-**文件位置**: `server/router/api/v1/v1.go:129-138`
+| 服务 | 注册路径 | 路径类型 | 注册顺序 |
+|------|----------|----------|----------|
+| **FileServerService** | `/file/attachments/:uid/:filename` | **参数化精确路径** | **最先** |
+| gRPC-Gateway | `/api/v1/*` | 通配符路径 | 中间 |
+| gRPC-Gateway | `/file/*` | **通配符路径** | **后** |
+| Connect RPC | `/memos.api.v1.*` | 通配符路径 | 最后 |
 
-```go
-// 路径匹配
-gwGroup.Any("/api/v1/*", handler)
-gwGroup.Any("/file/*", handler)  // 注意：/file/* 也走这个网关
+#### 证据 3：Echo v5 路由匹配规则
 
-// 网关认证中间件
-gatewayAuthMiddleware := func(next runtime.HandlerFunc) runtime.HandlerFunc {
-  return func(w http.ResponseWriter, r *http.Request, pathParams map[string]string) {
-    ctx := r.Context()
-    
-    // 获取 RPC 方法名（由 grpc-gateway 在路由后设置）
-    rpcMethod, ok := runtime.RPCMethod(ctx)
-    
-    // 提取凭证并认证
-    authHeader := r.Header.Get("Authorization")
-    result := authenticator.Authenticate(ctx, authHeader)
-    
-    // 关键逻辑：
-    // 1. 如果认证成功 (result != nil) → 放行
-    // 2. 如果认证失败，但无法确定 RPC 方法 (!ok) → 放行（服务层处理）
-    // 3. 如果认证失败，且方法不在白名单 → 拒绝
-    
-    if result == nil && ok && !IsPublicMethod(rpcMethod) {
-      http.Error(w, `{"code": 16, "message": "authentication required"}`, http.StatusUnauthorized)
-      return
-    }
-    
-    // 应用认证结果到上下文
-    if result != nil {
-      ctx = auth.ApplyToContext(ctx, result)
-      r = r.WithContext(ctx)
-    }
-    
-    next(w, r, pathParams)
-  }
-}
+Echo 框架的路由匹配优先级：
+
+```
+1. 精确路径 (无参数) > 2. 参数化路径 (:param) > 3. 通配符路径 (*)
+                    并且
+            先注册 > 后注册
 ```
 
-**关键分析**：
+对于请求 `GET /file/attachments/abc123/photo.jpg`：
 
-| 场景 | `ok` (是否能确定 RPC 方法) | 行为 |
-|------|---------------------------|------|
-| 标准 API 请求 (`/api/v1/attachments/123`) | `true` | 检查 `IsPublicMethod`，附件服务不在白名单 → 需认证 |
-| 文件服务请求 (`/file/attachments/uid/name`) | `false` | 无法确定 RPC 方法 → **放行到服务层** |
+| 候选路由 | 路径类型 | 是否匹配 |
+|----------|----------|----------|
+| `/file/attachments/:uid/:filename` | 参数化精确路径 | **✅ 优先匹配** |
+| `/file/*` | 通配符路径 | ❌ 不会被触发 |
 
-**重要发现**：
-- `/file/*` 路径虽然注册到了 gRPC-Gateway，但由于文件服务不是标准 gRPC 方法，`runtime.RPCMethod()` 无法获取方法名
-- 因此**文件服务的所有请求都会被网关层放行**，权限检查完全在 `fileserver.go` 中实现
+### 4.2 修正后的结论：文件请求完全绕过 gRPC-Gateway
 
-### 4.4 入口三：HTTP 文件服务（独立权限检查）
+**之前的错误分析**：
+> 文件请求经过 gRPC-Gateway，因无法确定 RPC 方法名 (`rpcMethod, ok = runtime.RPCMethod(ctx)`) 而被放行。
 
-**文件位置**: `server/router/fileserver/fileserver.go:checkAttachmentPermission`
+**修正后的正确结论**：
 
-文件服务有独立的、完整的权限检查逻辑：
+```
+请求: GET /file/attachments/abc123/photo.jpg
 
+  Echo 路由匹配过程:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  候选路由 1: /file/attachments/:uid/:filename                   │
+  │              - 类型: 参数化精确路径                              │
+  │              - 注册顺序: 最先                                    │
+  │              - 优先级: 高                                        │
+  │                                 ↓                                │
+  │  ✅ 优先匹配！直接进入 FileServerService.serveAttachmentFile()   │
+  │                                 ↓                                │
+  │  ❌ gRPC-Gateway 的 /file/* 通配符路由 根本不会被触发！         │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+**关键修正**：
+- `gRPC-Gateway` 注册的 `/file/*` 路径**实际上不会被附件访问请求命中**
+- 文件请求**直接进入** `FileServerService.serveAttachmentFile()`
+- **完全绕过了 gRPC-Gateway 的所有中间件**，包括 `gatewayAuthMiddleware`
+
+### 4.3 三类请求的实际鉴权链路
+
+#### 链路 1：Connect RPC (`/memos.api.v1.*`)
+
+**路径**: `POST /memos.api.v1.AttachmentService/CreateAttachment`
+
+**鉴权链路**：
+
+```
+Connect RPC 请求
+    ↓
+connectGroup.Any("/memos.api.v1.*", ...)
+    ↓
+Connect 拦截器链（注册在 `connect.WithInterceptors`）:
+    1. NewMetadataInterceptor()     - HTTP头 → gRPC metadata
+    2. NewLoggingInterceptor()
+    3. NewRecoveryInterceptor()
+    4. NewAuthInterceptor()          ← 认证在这里！
+       - 使用 `PublicMethods` 白名单
+       - `AttachmentService` 不在白名单 → 必须认证
+    ↓
+服务方法 (e.g., CreateAttachment)
+    ↓
+服务层权限检查 (checkAttachmentAccess)
+```
+
+**认证逻辑** (`NewAuthInterceptor`):
 ```go
-func (s *FileServerService) checkAttachmentPermission(ctx context.Context, c *echo.Context, attachment *store.Attachment) error {
-  // 场景 1: 未关联 Memo 的附件
-  if attachment.MemoID == nil {
-    user, err := s.getCurrentUser(ctx, c)
+// 检查是否在白名单
+if !IsPublicMethod(spec.Procedure) {
+    // 不在白名单 → 必须认证
+    user := s.getCurrentUser(ctx)
     if user == nil {
-      return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized access")
+        return nil, connect.NewError(connect.CodeUnauthenticated, ...)
     }
-    if user.ID != attachment.CreatorID && user.Role != store.RoleAdmin {
-      return echo.NewHTTPError(http.StatusForbidden, "forbidden access")
-    }
-    return nil
-  }
-
-  // 场景 2: 关联 Memo 的附件
-  memo, _ := s.Store.GetMemo(ctx, &store.FindMemo{ID: attachment.MemoID})
-  
-  // Public Memo: 任何人可访问
-  if memo.Visibility == store.Public {
-    return nil
-  }
-
-  // 特性：Share Token 临时访问（API 层不支持）
-  if shareToken := c.QueryParam("share_token"); shareToken != "" {
-    ms, err := s.Store.GetMemoShare(ctx, &store.FindMemoShare{UID: &shareToken})
-    if err == nil && ms != nil && !isMemoShareExpired(ms) && ms.MemoID == memo.ID {
-      return nil  // 有效 Share Token → 允许访问
-    }
-  }
-
-  // 需要登录
-  user, _ := s.getCurrentUser(ctx, c)
-  if user == nil {
-    return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized access")
-  }
-
-  // Private Memo: 仅创建者/管理员
-  if memo.Visibility == store.Private && user.ID != memo.CreatorID && user.Role != store.RoleAdmin {
-    return echo.NewHTTPError(http.StatusForbidden, "forbidden access")
-  }
-
-  return nil
 }
 ```
 
-### 4.5 三入口鉴权对比表
+#### 链路 2：gRPC-Gateway (`/api/v1/*`)
+
+**路径**: `POST /api/v1/attachments`
+
+**鉴权链路**：
+
+```
+REST API 请求
+    ↓
+gwGroup.Any("/api/v1/*", handler)
+    ↓
+gwMux (gRPC-Gateway ServeMux)
+    ↓
+gatewayAuthMiddleware ← 认证在这里！
+    - 获取 RPC 方法名: rpcMethod, ok := runtime.RPCMethod(ctx)
+    - 检查: IsPublicMethod(rpcMethod)
+    - 附件服务不在白名单 → 必须认证
+    ↓
+服务方法 (通过 gRPC-Gateway 转发)
+    ↓
+服务层权限检查 (checkAttachmentAccess)
+```
+
+**认证逻辑** (`gatewayAuthMiddleware`):
+```go
+if result == nil && ok && !IsPublicMethod(rpcMethod) {
+    // 认证失败 + 方法确定 + 不在白名单 → 拒绝
+    http.Error(w, `{"code": 16, "message": "authentication required"}`, http.StatusUnauthorized)
+    return
+}
+```
+
+#### 链路 3：HTTP 文件服务 (`/file/attachments/:uid/:filename`)
+
+**路径**: `GET /file/attachments/abc123/photo.jpg`
+
+**关键**: **完全绕过 gRPC-Gateway**！
+
+**鉴权链路**：
+
+```
+文件访问请求
+    ↓
+✅ 匹配 FileServerService 的路由 (优先级更高)
+    ↓
+serveAttachmentFile()  ← 无任何 Echo 中间件！
+    ↓
+内部调用:
+    1. s.authenticator.Authenticate()  ← 直接认证，不依赖白名单
+       - 提取 Authorization header
+       - 提取 Cookie
+       - 提取 URL 参数 share_token
+    ↓
+    2. checkAttachmentPermission()  ← 完整权限检查
+       - 检查 Memo 可见性
+       - 支持 Share Token
+       - Public Memo: 允许匿名访问
+```
+
+**关键差异**：
+- **没有**网关层的 `PublicMethods` 白名单检查
+- **直接**在业务逻辑中进行认证和授权
+- **支持** `share_token` URL 参数
+- **允许**匿名访问 Public Memo 的附件
+
+### 4.4 修正后的三入口鉴权对比表
 
 | 维度 | Connect RPC | gRPC-Gateway (API) | HTTP 文件服务 |
 |------|-------------|---------------------|---------------|
-| **路径** | `/memos.api.v1.*` | `/api/v1/*` | `/file/attachments/*` |
-| **网关层鉴权** | ✅ 严格检查 | ✅ 严格检查 | ❌ 放行（方法名不确定） |
-| **白名单依赖** | `PublicMethods` | `PublicMethods` | 不依赖 |
-| **附件服务** | 不在白名单 → 需认证 | 不在白名单 → 需认证 | 网关放行 |
-| **服务层鉴权** | `checkAttachmentAccess` | `checkAttachmentAccess` | `checkAttachmentPermission` |
+| **路径** | `/memos.api.v1.*` | `/api/v1/*` | `/file/attachments/:uid/:filename` |
+| **路由类型** | 通配符 | 通配符 | **参数化精确路径** |
+| **注册顺序** | 最后 | 中间 | **最先** |
+| **匹配优先级** | 低 | 低 | **最高** |
+| **是否经过网关中间件** | ✅ Connect 拦截器 | ✅ Gateway 中间件 | **❌ 完全绕过** |
+| **白名单依赖** | `PublicMethods` | `PublicMethods` | **不依赖** |
+| **认证位置** | 拦截器层 | 网关中间件 | **服务方法内部** |
 | **Share Token** | ❌ 不支持 | ❌ 不支持 | ✅ 支持 |
-| **Public Memo 附件** | 网关层拒绝（无认证） | 网关层拒绝（无认证） | 服务层允许 |
+| **Public Memo 附件匿名访问** | ❌ 网关层拒绝 | ❌ 网关层拒绝 | ✅ 服务层允许 |
+| **设计目的** | 浏览器前端 API | REST API 兼容 | **文件下载、Range 请求、直接嵌入** |
 
-### 4.6 边界场景分析
+### 4.5 修正后的边界场景分析
 
 #### 场景 1：未登录用户访问 Public Memo 的附件
 
 **请求路径**: `GET /file/attachments/abc123/photo.jpg`
 
-**鉴权流程**:
-1. **网关层**: `runtime.RPCMethod()` 返回 `ok = false` → 放行
-2. **服务层** (`checkAttachmentPermission`):
+**修正后的鉴权流程**:
+1. **路由匹配**: 匹配 `FileServerService` 的 `/file/attachments/:uid/:filename`
+2. **是否经过 gRPC-Gateway**: **否**（优先级更高）
+3. **服务层** (`checkAttachmentPermission`):
    - `attachment.MemoID != nil` → 关联了 Memo
    - `memo.Visibility == Public` → 返回 `nil`（允许）
 
 **结果**: ✅ 访问成功
 
 **对比**：如果通过 API 层 `GetAttachment` 访问：
-- 网关层：`AttachmentService` 不在白名单 → 需要认证
+- 必须经过网关层
+- `AttachmentService` 不在白名单 → 需要认证
 - 未登录请求直接返回 `Unauthenticated`
 
-#### 场景 2：使用 Share Token 访问 Private Memo 的附件
+#### 场景 2：gRPC-Gateway 的 `/file/*` 到底是做什么的？
 
-**请求路径**: `GET /file/attachments/abc123/photo.jpg?share_token=xyz789`
+**答案**：它是一个**备用路由**，但实际上**不会被附件访问请求触发**。
 
-**鉴权流程**:
-1. **网关层**: 放行
-2. **服务层**:
-   - `memo.Visibility == Private`
-   - 检查 `share_token` 参数
-   - Token 有效且对应正确的 Memo → 允许访问
+```
+gRPC-Gateway 注册了两个通配符路由:
+  - /api/v1/*  → 用于 REST API 兼容
+  - /file/*    → 备用路由，实际不会被附件请求触发
 
-**结果**: ✅ 访问成功
+原因:
+  - FileServerService 的路由 /file/attachments/:uid/:filename 是参数化精确路径
+  - 参数化路径优先级 > 通配符路径
+  - 且 FileServerService 先注册
 
-**对比**：API 层 `GetAttachment` 不支持 `share_token` 参数，无法通过此方式访问。
+所以 /file/* 通配符路由:
+  - 不会被 /file/attachments/uid/name 触发
+  - 可能用于其他 /file/... 路径（如果有）
+  - 对附件访问没有实际影响
+```
 
-#### 场景 3：未登录用户访问未绑定的附件
-
-**请求路径**: `GET /file/attachments/abc123/photo.jpg`（附件 `MemoID = nil`）
-
-**鉴权流程**:
-1. **网关层**: 放行
-2. **服务层**:
-   - `attachment.MemoID == nil`
-   - `getCurrentUser()` 返回 `nil`（未登录）
-   - 返回 `Unauthorized`
-
-**结果**: ❌ 访问被拒绝
-
-### 4.7 鉴权边界总结
+### 4.6 修正后的鉴权边界总结
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         鉴权边界关键差异                                      │
+│                    修正后的鉴权边界关键差异                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  网关层 vs 服务层的分工:                                                     │
+│  路由匹配优先级决定一切:                                                      │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │                                                                       │  │
-│  │   网关层 (AuthInterceptor / gatewayAuthMiddleware)                   │  │
-│  │   ┌──────────────────────────────────────────────────────────────┐   │  │
-│  │   │  职责: 认证凭证验证（是否登录）                                │   │  │
-│  │   │  依据: PublicMethods 白名单                                   │   │  │
-│  │   │  特点: 粗粒度，只区分"公开/非公开"方法                        │   │  │
-│  │   └──────────────────────────────────────────────────────────────┘   │  │
-│  │                              ↓                                         │  │
-│  │   服务层 (checkAttachmentAccess / checkAttachmentPermission)          │  │
-│  │   ┌──────────────────────────────────────────────────────────────┐   │  │
-│  │   │  职责: 具体业务权限检查                                        │   │  │
-│  │   │  依据: 附件状态、Memo 可见性、用户身份、Share Token           │   │  │
-│  │   │  特点: 细粒度，完整的权限决策逻辑                              │   │  │
-│  │   └──────────────────────────────────────────────────────────────┘   │  │
+│  │   Echo 匹配规则:                                                      │  │
+│  │   精确路径 > 参数化路径 > 通配符路径                                  │  │
+│  │   先注册 > 后注册                                                     │  │
+│  │                                                                       │  │
+│  │   实际注册顺序:                                                        │  │
+│  │   1. /file/attachments/:uid/:filename (FileServerService, 最先)    │  │
+│  │   2. /api/v1/* (gRPC-Gateway, 中间)                                  │  │
+│  │   3. /file/* (gRPC-Gateway, 后)                                      │  │
+│  │   4. /memos.api.v1.* (Connect RPC, 最后)                             │  │
+│  │                                                                       │  │
+│  │   关键结论:                                                            │  │
+│  │   /file/attachments/uid/name → 优先匹配 FileServerService           │  │
+│  │                                    完全绕过 gRPC-Gateway！            │  │
 │  │                                                                       │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
-│  文件服务的特殊性:                                                           │
+│  三类请求的实际鉴权链路:                                                      │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │                                                                       │  │
-│  │   由于 /file/* 路径无法被 grpc-gateway 识别为标准 RPC 方法，        │  │
-│  │   网关层会放行所有请求，完全依赖服务层的权限检查。                    │  │
+│  │   Connect RPC (/memos.api.v1.*):                                     │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │   │  经过 Connect 拦截器 → NewAuthInterceptor → PublicMethods    │  │  │
+│  │   │  附件服务不在白名单 → 必须认证                                  │  │  │
+│  │   └──────────────────────────────────────────────────────────────┘  │  │
 │  │                                                                       │  │
-│  │   这导致了一个重要的边界差异:                                        │  │
-│   │                                                                       │  │
-│  │   - Public Memo 的附件: 通过文件服务可匿名访问                       │  │
-│  │   - 通过 API GetAttachment: 需要先登录（网关层拦截）                 │  │
+│  │   gRPC-Gateway (/api/v1/*):                                          │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │   │  经过 gatewayAuthMiddleware → runtime.RPCMethod → PublicMethods │  │
+│  │   │  附件服务不在白名单 → 必须认证                                  │  │  │
+│  │   └──────────────────────────────────────────────────────────────┘  │  │
 │  │                                                                       │  │
-│  │   设计意图:                                                           │  │
-│  │   - 文件服务用于直接嵌入到网页、邮件中的资源链接                      │  │
-│  │   - 这些场景下用户可能没有登录状态                                    │  │
-│  │   - 但业务权限仍由服务层严格控制                                      │  │
+│  │   HTTP 文件服务 (/file/attachments/:uid/:filename):                  │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │   │  ✅ 完全绕过 gRPC-Gateway                                      │  │  │
+│  │   │  ↓                                                             │  │  │
+│  │   │  直接进入 serveAttachmentFile()                                │  │  │
+│  │   │  ↓                                                             │  │  │
+│  │   │  内部调用 authenticator.Authenticate()                         │  │  │
+│  │   │  内部调用 checkAttachmentPermission()                          │  │  │
+│  │   │  ↓                                                             │  │  │
+│  │   │  特点:                                                         │  │  │
+│  │   │  - 不依赖 PublicMethods 白名单                                 │  │  │
+│  │   │  - 支持 share_token URL 参数                                   │  │  │
+│  │   │  - Public Memo 附件允许匿名访问                                │  │  │
+│  │   └──────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  gRPC-Gateway 的 /file/* 路由:                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │   实际影响: 无（对附件访问请求）                                      │  │
+│  │   原因:                                                                │  │
+│  │   - FileServerService 的路由优先级更高                                │  │
+│  │   - /file/* 是通配符，优先级低于参数化路径                            │  │
+│  │   - 这是一个备用/兜底路由，不会被附件请求触发                          │  │
 │  │                                                                       │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
@@ -1548,4 +1566,227 @@ func (s *FileServerService) serveMotionClip(c *echo.Context, attachment *store.A
 
 ### 8.1 Attachment 结构体
 
-**文件位置**: `
+**文件位置**: `store/attachment.go`
+
+```go
+type Attachment struct {
+  // 系统字段
+  ID        int32   // 内部主键
+  UID       string  // 对外唯一标识（URL 友好）
+  
+  // 标准字段
+  CreatorID int32   // 创建者用户 ID
+  CreatedTs int64   // 创建时间戳
+  UpdatedTs int64   // 更新时间戳
+  
+  // 业务字段
+  Filename    string                        // 文件名
+  Blob        []byte                        // 文件内容（仅 DATABASE 存储类型）
+  Type        string                        // MIME 类型
+  Size        int64                         // 文件大小（字节）
+  StorageType storepb.AttachmentStorageType // 存储类型: DATABASE/LOCAL/S3/EXTERNAL
+  Reference   string                        // 引用路径/URL
+  Payload     *storepb.AttachmentPayload    // 额外载荷（S3 配置、Motion Media 等）
+  
+  // 关联字段
+  MemoID  *int32   // 关联的 Memo ID（可选）
+  MemoUID *string  // 关联的 Memo UID（组合字段）
+}
+```
+
+### 8.2 AttachmentPayload 结构
+
+```protobuf
+message AttachmentPayload {
+  oneof payload {
+    S3Object s3_object = 1;
+    MotionMedia motion_media = 2;
+  }
+}
+
+message S3Object {
+  StorageS3Config s3_config = 1;      // S3 配置（用于刷新预签名 URL）
+  string key = 2;                      // 对象键
+  google.protobuf.Timestamp last_presigned_time = 3;  // 上次预签名时间
+}
+
+message MotionMedia {
+  MotionMediaFamily family = 1;        // ANDROID_MOTION_PHOTO / APPLE_LIVE_PHOTO
+  MotionMediaRole role = 2;            // CONTAINER / STILL / VIDEO
+  string group_id = 3;                  // 分组 ID（用于关联静态图和视频）
+  int64 presentation_timestamp_us = 4;  // 展示时间戳
+  bool has_embedded_video = 5;          // 是否包含内嵌视频
+}
+```
+
+### 8.3 存储类型枚举
+
+```protobuf
+enum AttachmentStorageType {
+  ATTACHMENT_STORAGE_TYPE_UNSPECIFIED = 0;
+  DATABASE = 1;  // 存储在数据库 BLOB
+  LOCAL = 2;     // 存储在本地文件系统
+  S3 = 3;        // 存储在 S3 兼容对象存储
+  EXTERNAL = 4;  // 外部链接（用户直接提供 URL）
+}
+```
+
+---
+
+## 九、附件删除流程
+
+### 9.1 删除逻辑
+
+**文件位置**: `store/attachment.go`
+
+```go
+func (s *Store) DeleteAttachment(ctx context.Context, delete *DeleteAttachment) error {
+  // 1. 获取附件信息
+  attachment, err := s.GetAttachment(ctx, &FindAttachment{ID: &delete.ID})
+  
+  // 2. 删除存储中的文件（本地文件或 S3 对象）
+  if err := s.DeleteAttachmentStorage(ctx, attachment); err != nil {
+    if attachment.StorageType == storepb.AttachmentStorageType_LOCAL {
+      return errors.Wrap(err, "failed to delete local file")
+    }
+    // S3 删除失败仅记录警告，不阻断数据库删除
+    slog.Warn("Failed to delete attachment storage", slog.Any("err", err))
+  }
+  
+  // 3. 删除数据库记录
+  return s.driver.DeleteAttachment(ctx, delete)
+}
+```
+
+### 9.2 S3 对象删除
+
+```go
+func (s *Store) deleteAttachmentStorageImpl(ctx context.Context, attachment *Attachment, instanceStorageSetting *storepb.InstanceStorageSetting) error {
+  if attachment.StorageType == storepb.AttachmentStorageType_S3 {
+    s3ObjectPayload := attachment.Payload.GetS3Object()
+    
+    // 1. 获取 S3 配置
+    // - 优先使用 attachment 中保存的配置
+    // - 否则使用当前实例配置（兼容旧数据）
+    s3Config := s3ObjectPayload.S3Config
+    if s3Config == nil {
+      if instanceStorageSetting == nil {
+        instanceStorageSetting, _ = s.GetInstanceStorageSetting(ctx)
+      }
+      s3Config = instanceStorageSetting.S3Config
+    }
+    
+    // 2. 创建客户端并删除
+    s3Client, _ := s3.NewClient(ctx, s3Config)
+    s3Client.DeleteObject(ctx, s3ObjectPayload.Key)
+  }
+  
+  // 3. 删除衍生缓存（缩略图、动态照片视频）
+  s.deleteAttachmentDerivedCaches(attachment)
+  return nil
+}
+```
+
+---
+
+## 十、关键配置项
+
+### 10.1 实例存储配置
+
+**文件位置**: `store/instance_setting.go`
+
+```go
+type InstanceStorageSetting struct {
+  StorageType          InstanceStorageSetting_StorageType  // LOCAL / S3
+  UploadSizeLimitMb    int32                               // 上传大小限制（MB）
+  FilepathTemplate     string                              // 路径模板
+  S3Config             *StorageS3Config                    // S3 配置（仅 S3 模式）
+}
+
+// 默认值
+const (
+  defaultInstanceStorageType       = storepb.InstanceStorageSetting_LOCAL
+  defaultInstanceUploadSizeLimitMb = 30
+  defaultInstanceFilepathTemplate  = "assets/{timestamp}_{uuid}_{filename}"
+)
+```
+
+### 10.2 上传缓冲区
+
+```go
+const (
+  MaxUploadBufferSizeBytes = 32 << 20  // 32 MiB 内存缓冲区
+  MebiByte                 = 1024 * 1024
+)
+```
+
+---
+
+## 十一、总结
+
+### 11.1 架构亮点
+
+1. **多存储抽象**: 通过统一的 `StorageType` 和 `Reference` 字段，透明支持数据库、本地文件、S3 三种存储方式
+
+2. **预签名 URL 自动刷新**: S3 模式下，后台任务定期刷新即将过期的预签名 URL，对用户无感知
+
+3. **灵活的权限模型**:
+   - 附件权限与关联的 Memo 可见性绑定
+   - 支持 Share Token 临时访问
+   - 未绑定 Memo 的附件仅限创建者访问
+
+4. **多入口鉴权分层**:
+   - 网关层：粗粒度的白名单认证
+   - 服务层：细粒度的业务权限检查
+   - 文件服务：独立的权限逻辑，支持匿名访问 Public Memo 附件
+
+5. **删除权限差异化**:
+   - 单个删除：隐式权限控制，返回 NotFound 防止信息泄露
+   - 批量删除：显式权限检查，支持管理员操作
+
+6. **隐私保护**: 图片自动剥离 EXIF 元数据，防止 GPS 位置等敏感信息泄露
+
+7. **安全防护**: XSS 类型强制下载、安全响应头、路径遍历防护
+
+### 11.2 数据流概览
+
+```
+上传流程:
+前端 → gRPC CreateAttachment → 验证 → EXIF剥离 → SaveAttachmentBlob (本地/S3) → 数据库记录
+
+访问流程:
+/file/attachments/:uid → 权限检查 → 按存储类型服务
+  - LOCAL: 直接读取文件
+  - S3: 重定向预签名URL 或 代理流式读取
+  - DATABASE: 从 BLOB 字段读取
+
+权限决策链路:
+未绑定 Memo → 仅创建者/管理员
+    ↓
+SetMemoAttachments (三层权限检查)
+    ↓
+已绑定 Memo → Public: 任何人
+              Protected: 登录用户
+              Private: 创建者/管理员
+              + Share Token: 临时授权访问
+
+删除权限差异:
+DeleteAttachment (单个) → 查询时限制 CreatorID → 返回 NotFound
+BatchDeleteAttachments (批量) → 显式检查 → 管理员可删除任意附件
+```
+
+### 11.3 关键文件索引
+
+| 功能 | 文件路径 |
+|------|----------|
+| 前端上传服务 | `web/src/components/MemoEditor/services/uploadService.ts` |
+| 附件 API 服务 | `server/router/api/v1/attachment_service.go` |
+| 附件与 Memo 绑定服务 | `server/router/api/v1/memo_attachment_service.go` |
+| HTTP 文件服务器 | `server/router/fileserver/fileserver.go` |
+| S3 客户端实现 | `internal/storage/s3/s3.go` |
+| S3 预签名刷新 | `server/runner/s3presign/runner.go` |
+| 附件存储层 | `store/attachment.go` |
+| 实例配置管理 | `store/instance_setting.go` |
+| 公开端点 ACL | `server/router/api/v1/acl_config.go` |
+| 认证中间件 | `server/router/api/v1/v1.go` |
+| 认证器实现 | `server/auth/authenticator.go` |
