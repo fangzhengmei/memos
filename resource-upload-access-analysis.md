@@ -1,6 +1,6 @@
 # 资源文件上传与访问控制分析
 
-本文档详细分析了 Memos 项目中资源文件的上传流程、外部存储（S3）接入方式以及资源访问控制逻辑。
+本文档详细分析了 Memos 项目中资源文件的上传流程、外部存储（S3）接入方式、资源访问控制逻辑、附件与备忘录绑定的权限变化、不同入口的鉴权边界差异，以及删除权限的差异。
 
 ---
 
@@ -168,10 +168,11 @@ func stripImageExif(imageData []byte, mimeType string) ([]byte, error) {
 
 ### 2.1 存储架构概览
 
-系统支持三种存储类型：
+系统支持四种存储类型：
 1. **DATABASE**: 文件内容直接存储在数据库的 BLOB 字段中
 2. **LOCAL**: 文件存储在本地文件系统
 3. **S3**: 文件存储在兼容 S3 协议的对象存储服务
+4. **EXTERNAL**: 外部链接（用户直接提供 URL）
 
 ### 2.2 S3 客户端实现
 
@@ -377,23 +378,772 @@ func (r *Runner) CheckAndPresign(ctx context.Context) {
 
 ---
 
-## 三、资源访问控制逻辑
+## 三、附件与备忘录绑定的权限变化链路
 
-### 3.1 访问入口
+### 3.1 绑定前的权限状态
+
+**文件位置**: `server/router/api/v1/attachment_service.go:checkAttachmentAccess` 和 `server/router/fileserver/fileserver.go:checkAttachmentPermission`
+
+附件在**未绑定到备忘录**时（`MemoID == nil`），权限规则非常严格：
+
+```go
+// 未关联 Memo: 只有创建者或管理员可访问
+if attachment.MemoID == nil {
+  if user == nil {
+    return status.Errorf(codes.Unauthenticated, "user not authenticated")
+  }
+  if attachment.CreatorID != user.ID && !isSuperUser(user) {
+    return status.Errorf(codes.PermissionDenied, "permission denied")
+  }
+  return nil
+}
+```
+
+**绑定前权限总结**：
+
+| 访问者 | 权限 |
+|--------|------|
+| 未登录用户 | ❌ Unauthenticated |
+| 附件创建者 | ✅ 允许访问 |
+| 其他登录用户 | ❌ PermissionDenied |
+| 管理员 | ✅ 允许访问 |
+
+### 3.2 绑定过程的权限控制
+
+**文件位置**: `server/router/api/v1/memo_attachment_service.go`
+
+绑定操作通过 `SetMemoAttachments` API 完成，该过程有多层权限检查：
+
+#### 3.2.1 第一层：Memo 修改权限
+
+```go
+func (s *APIV1Service) SetMemoAttachments(ctx context.Context, request *v1pb.SetMemoAttachmentsRequest) (*emptypb.Empty, error) {
+  user, err := s.fetchCurrentUser(ctx)
+  // ...
+  
+  memo, err := s.Store.GetMemo(ctx, &store.FindMemo{UID: &memoUID})
+  // ...
+  
+  // 关键检查：用户必须能修改 Memo
+  if !canModifyMemo(user, memo) {
+    return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+  }
+  // ...
+}
+```
+
+**`canModifyMemo` 规则**（通常定义在备忘录服务中）：
+- Memo 创建者可以修改
+- 管理员可以修改任意 Memo
+
+#### 3.2.2 第二层：附件归属检查
+
+在 `normalizeMemoAttachmentRequest` 中，检查要绑定的附件是否属于当前用户：
+
+```go
+func (s *APIV1Service) normalizeMemoAttachmentRequest(
+  ctx context.Context,
+  user *store.User,
+  currentAttachments []*store.Attachment,
+  requestAttachments []*v1pb.Attachment,
+) ([]*store.Attachment, error) {
+  for _, requestAttachment := range requestAttachments {
+    attachmentUID, _ := ExtractAttachmentUIDFromName(requestAttachment.Name)
+    attachment, _ := s.Store.GetAttachment(ctx, &store.FindAttachment{UID: &attachmentUID})
+    
+    // 关键检查：不能绑定其他用户的附件
+    if attachment.CreatorID != user.ID && !isSuperUser(user) {
+      return nil, status.Errorf(codes.PermissionDenied, "cannot attach another user's attachment")
+    }
+  }
+  // ...
+}
+```
+
+#### 3.2.3 第三层：解绑时的权限检查
+
+在 `setMemoAttachmentsInternal` 中，对于不再绑定的附件（需要解绑），同样有权限检查：
+
+```go
+func (s *APIV1Service) setMemoAttachmentsInternal(ctx context.Context, user *store.User, memo *store.Memo, requestAttachments []*v1pb.Attachment) error {
+  // ...
+  
+  // 删除不在请求中的附件（解绑）
+  for _, attachment := range currentAttachments {
+    if !requestedIDs[attachment.ID] {
+      // 关键检查：不能移除其他用户的附件
+      if attachment.CreatorID != user.ID && !isSuperUser(user) {
+        return status.Errorf(codes.PermissionDenied, "cannot remove another user's attachment")
+      }
+      // 执行删除/解绑
+      s.Store.DeleteAttachment(ctx, &store.DeleteAttachment{
+        ID:     int32(attachment.ID),
+        MemoID: &memo.ID,
+      })
+    }
+  }
+  
+  // 绑定新附件：更新 MemoID
+  for index, attachment := range normalizedAttachments {
+    updatedTs := time.Now().Unix() + int64(index)
+    s.Store.UpdateAttachment(ctx, &store.UpdateAttachment{
+      ID:        attachment.ID,
+      MemoID:    &memo.ID,  // 绑定到 Memo
+      UpdatedTs: &updatedTs,
+    })
+  }
+  // ...
+}
+```
+
+### 3.3 绑定后的权限状态
+
+附件绑定到备忘录后（`MemoID != nil`），权限**完全遵循备忘录的可见性规则**：
+
+```go
+// 关联 Memo: 遵循 Memo 可见性
+memo, _ := s.Store.GetMemo(ctx, &store.FindMemo{ID: attachment.MemoID})
+
+if memo.Visibility == store.Public {
+  return nil  // 公开，任何人可访问
+}
+
+if user == nil {
+  return status.Errorf(codes.Unauthenticated, "user not authenticated")
+}
+
+// 私有 Memo: 只有创建者或管理员
+if memo.Visibility == store.Private && memo.CreatorID != user.ID && !isSuperUser(user) {
+  return status.Errorf(codes.PermissionDenied, "permission denied")
+}
+
+return nil
+```
+
+### 3.4 权限变化链路图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        附件权限状态转换链路                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────┐                                                           │
+│  │  新建附件    │  MemoID = nil                                             │
+│  │  (未绑定)    │                                                           │
+│  └──────┬───────┘                                                           │
+│         │                                                                   │
+│         │ 权限规则:                                                         │
+│         │  - 必须登录                                                       │
+│         │  - 仅创建者/管理员可访问                                          │
+│         │  - 其他用户即使登录也无法访问                                      │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                    SetMemoAttachments (绑定过程)                       │  │
+│  │  权限检查:                                                             │  │
+│  │  1. 当前用户必须能修改目标 Memo (canModifyMemo)                        │  │
+│  │  2. 要绑定的附件必须属于当前用户 (或管理员)                              │  │
+│  │  3. 要解绑的附件必须属于当前用户 (或管理员)                              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌──────────────┐                                                           │
+│  │  已绑定附件  │  MemoID = memo.ID                                        │
+│  │              │                                                           │
+│  └──────┬───────┘                                                           │
+│         │                                                                   │
+│         │ 权限规则: 遵循 Memo 可见性                                        │
+│         │                                                                   │
+│         ├─────────────────┬─────────────────┬─────────────────┐            │
+│         ▼                 ▼                 ▼                 ▼            │
+│  ┌──────────┐      ┌──────────┐      ┌──────────┐      ┌──────────┐    │
+│  │  Public  │      │Protected │      │ Private  │      │ + Share  │    │
+│  │  Memo    │      │  Memo    │      │  Memo    │      │  Token   │    │
+│  └────┬─────┘      └────┬─────┘      └────┬─────┘      └────┬─────┘    │
+│       │                 │                 │                 │            │
+│       ▼                 ▼                 ▼                 ▼            │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │  任何人可访问        登录用户可访问     仅创建者/管理员     临时授权  │    │
+│  │  (无需登录)                                                      │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.5 绑定前后权限对比表
+
+| 维度 | 绑定前 (MemoID = nil) | 绑定后 (MemoID != nil) |
+|------|----------------------|------------------------|
+| **权限依据** | 附件创建者身份 | 关联 Memo 的可见性 |
+| **未登录用户** | ❌ 拒绝 | Public: ✅ 允许<br>其他: ❌ 拒绝 |
+| **创建者本人** | ✅ 允许 | ✅ 始终允许 |
+| **其他登录用户** | ❌ 拒绝 | Public: ✅ 允许<br>Protected: ✅ 允许<br>Private: ❌ 拒绝 |
+| **管理员** | ✅ 允许 | ✅ 始终允许 |
+| **Share Token** | ❌ 不支持 | ✅ 支持临时访问 |
+| **访问方式** | 只能通过 API 操作 | 可通过 API + 文件服务访问 |
+
+### 3.6 特殊场景：Motion Photo 分组绑定
+
+**文件位置**: `server/router/api/v1/memo_attachment_service.go:normalizeMemoAttachmentRequest`
+
+对于动态照片（Motion Photo / Live Photo），系统会自动处理分组：
+
+```go
+// Motion Photo 通常包含两个文件：静态图 + 视频
+// 它们通过 GroupID 关联
+
+requestGroups := make(map[string][]*store.Attachment)
+for _, attachment := range requestedAttachments {
+  motion := getAttachmentMotionMedia(attachment)
+  if motion == nil || motion.GroupId == "" {
+    continue
+  }
+  // 按 GroupID 分组
+  requestGroups[motion.GroupId] = append(requestGroups[motion.GroupId], attachment)
+}
+
+// 绑定逻辑：如果是多成员分组，需要所有成员都被请求才会绑定
+if isMultiMemberMotionGroup(currentGroup) && !allGroupMembersRequested(currentGroup, requestNamesByGroup[groupID]) {
+  appendedGroups[groupID] = true
+  continue  // 跳过，不绑定部分成员
+}
+```
+
+**设计意图**：防止 Motion Photo 的静态图和视频被分开绑定到不同的 Memo，保持媒体完整性。
+
+---
+
+## 四、多入口鉴权边界差异分析
+
+### 4.1 系统入口架构
+
+系统有三个主要的 API 入口，每个入口有不同的鉴权策略：
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                              客户端请求                                      │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          ▼                           ▼                           ▼
+┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+│  Connect RPC      │     │  gRPC-Gateway     │     │  HTTP 文件服务    │
+│  (浏览器前端)      │     │  (API 网关)       │     │  (文件下载)        │
+│                   │     │                   │     │                   │
+│  Path:            │     │  Path:            │     │  Path:            │
+│  /memos.api.v1.*  │     │  /api/v1/*        │     │  /file/*          │
+│  /memos.api.v1.*  │     │  /file/*          │     │                   │
+└─────────┬─────────┘     └─────────┬─────────┘     └─────────┬─────────┘
+          │                           │                           │
+          ▼                           ▼                           ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         鉴权策略差异                                          │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Connect RPC / gRPC-Gateway:                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 网关层中间件检查: IsPublicMethod() 白名单                        │   │
+│  │  2. 不在白名单 → 必须携带有效凭证                                     │   │
+│  │  3. 附件服务不在白名单 → 所有请求必须先认证                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  HTTP 文件服务:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 网关层放行（无法确定 RPC 方法名）                                 │   │
+│  │  2. 完全在服务层 checkAttachmentPermission() 中检查                  │   │
+│  │  3. 支持 Share Token 临时访问（API 层不支持）                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 入口一：Connect RPC（浏览器前端）
+
+**文件位置**: `server/router/api/v1/v1.go:166`
+
+```go
+// 路径匹配
+connectGroup.Any("/memos.api.v1.*", echo.WrapHandler(http.MaxBytesHandler(connectMux, maxAPIRequestBytes)))
+
+// 中间件链
+connectInterceptors := connect.WithInterceptors(
+  NewMetadataInterceptor(),
+  NewLoggingInterceptor(logStacktraces),
+  NewRecoveryInterceptor(logStacktraces),
+  NewAuthInterceptor(s.Store, s.Secret),  // 认证拦截器
+)
+```
+
+**鉴权逻辑**：`NewAuthInterceptor` 使用 `PublicMethods` 白名单
+
+```go
+// server/router/api/v1/acl_config.go
+var PublicMethods = map[string]struct{}{
+  // Auth 相关
+  "/memos.api.v1.AuthService/SignIn": {},
+  "/memos.api.v1.AuthService/RefreshToken": {},
+  
+  // Instance 相关
+  "/memos.api.v1.InstanceService/GetInstanceProfile": {},
+  "/memos.api.v1.InstanceService/GetInstanceSetting": {},
+  
+  // User 相关（公开资料）
+  "/memos.api.v1.UserService/CreateUser": {},
+  "/memos.api.v1.UserService/GetUser": {},
+  "/memos.api.v1.UserService/GetUserAvatar": {},
+  
+  // Memo 相关（可见性在服务层过滤）
+  "/memos.api.v1.MemoService/GetMemo": {},
+  "/memos.api.v1.MemoService/ListMemos": {},
+  "/memos.api.v1.MemoService/GetMemoByShare": {},
+  
+  // 注意: AttachmentService 的方法不在此列表中！
+}
+```
+
+**关键结论**：
+- `AttachmentService` 的所有方法（`GetAttachment`, `CreateAttachment`, `DeleteAttachment` 等）**不在白名单中**
+- 所有附件 API 请求**必须携带有效认证凭证**才能通过网关层
+- 未认证请求会直接返回 `16 Unauthenticated`
+
+### 4.3 入口二：gRPC-Gateway（API 网关）
+
+**文件位置**: `server/router/api/v1/v1.go:129-138`
+
+```go
+// 路径匹配
+gwGroup.Any("/api/v1/*", handler)
+gwGroup.Any("/file/*", handler)  // 注意：/file/* 也走这个网关
+
+// 网关认证中间件
+gatewayAuthMiddleware := func(next runtime.HandlerFunc) runtime.HandlerFunc {
+  return func(w http.ResponseWriter, r *http.Request, pathParams map[string]string) {
+    ctx := r.Context()
+    
+    // 获取 RPC 方法名（由 grpc-gateway 在路由后设置）
+    rpcMethod, ok := runtime.RPCMethod(ctx)
+    
+    // 提取凭证并认证
+    authHeader := r.Header.Get("Authorization")
+    result := authenticator.Authenticate(ctx, authHeader)
+    
+    // 关键逻辑：
+    // 1. 如果认证成功 (result != nil) → 放行
+    // 2. 如果认证失败，但无法确定 RPC 方法 (!ok) → 放行（服务层处理）
+    // 3. 如果认证失败，且方法不在白名单 → 拒绝
+    
+    if result == nil && ok && !IsPublicMethod(rpcMethod) {
+      http.Error(w, `{"code": 16, "message": "authentication required"}`, http.StatusUnauthorized)
+      return
+    }
+    
+    // 应用认证结果到上下文
+    if result != nil {
+      ctx = auth.ApplyToContext(ctx, result)
+      r = r.WithContext(ctx)
+    }
+    
+    next(w, r, pathParams)
+  }
+}
+```
+
+**关键分析**：
+
+| 场景 | `ok` (是否能确定 RPC 方法) | 行为 |
+|------|---------------------------|------|
+| 标准 API 请求 (`/api/v1/attachments/123`) | `true` | 检查 `IsPublicMethod`，附件服务不在白名单 → 需认证 |
+| 文件服务请求 (`/file/attachments/uid/name`) | `false` | 无法确定 RPC 方法 → **放行到服务层** |
+
+**重要发现**：
+- `/file/*` 路径虽然注册到了 gRPC-Gateway，但由于文件服务不是标准 gRPC 方法，`runtime.RPCMethod()` 无法获取方法名
+- 因此**文件服务的所有请求都会被网关层放行**，权限检查完全在 `fileserver.go` 中实现
+
+### 4.4 入口三：HTTP 文件服务（独立权限检查）
+
+**文件位置**: `server/router/fileserver/fileserver.go:checkAttachmentPermission`
+
+文件服务有独立的、完整的权限检查逻辑：
+
+```go
+func (s *FileServerService) checkAttachmentPermission(ctx context.Context, c *echo.Context, attachment *store.Attachment) error {
+  // 场景 1: 未关联 Memo 的附件
+  if attachment.MemoID == nil {
+    user, err := s.getCurrentUser(ctx, c)
+    if user == nil {
+      return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized access")
+    }
+    if user.ID != attachment.CreatorID && user.Role != store.RoleAdmin {
+      return echo.NewHTTPError(http.StatusForbidden, "forbidden access")
+    }
+    return nil
+  }
+
+  // 场景 2: 关联 Memo 的附件
+  memo, _ := s.Store.GetMemo(ctx, &store.FindMemo{ID: attachment.MemoID})
+  
+  // Public Memo: 任何人可访问
+  if memo.Visibility == store.Public {
+    return nil
+  }
+
+  // 特性：Share Token 临时访问（API 层不支持）
+  if shareToken := c.QueryParam("share_token"); shareToken != "" {
+    ms, err := s.Store.GetMemoShare(ctx, &store.FindMemoShare{UID: &shareToken})
+    if err == nil && ms != nil && !isMemoShareExpired(ms) && ms.MemoID == memo.ID {
+      return nil  // 有效 Share Token → 允许访问
+    }
+  }
+
+  // 需要登录
+  user, _ := s.getCurrentUser(ctx, c)
+  if user == nil {
+    return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized access")
+  }
+
+  // Private Memo: 仅创建者/管理员
+  if memo.Visibility == store.Private && user.ID != memo.CreatorID && user.Role != store.RoleAdmin {
+    return echo.NewHTTPError(http.StatusForbidden, "forbidden access")
+  }
+
+  return nil
+}
+```
+
+### 4.5 三入口鉴权对比表
+
+| 维度 | Connect RPC | gRPC-Gateway (API) | HTTP 文件服务 |
+|------|-------------|---------------------|---------------|
+| **路径** | `/memos.api.v1.*` | `/api/v1/*` | `/file/attachments/*` |
+| **网关层鉴权** | ✅ 严格检查 | ✅ 严格检查 | ❌ 放行（方法名不确定） |
+| **白名单依赖** | `PublicMethods` | `PublicMethods` | 不依赖 |
+| **附件服务** | 不在白名单 → 需认证 | 不在白名单 → 需认证 | 网关放行 |
+| **服务层鉴权** | `checkAttachmentAccess` | `checkAttachmentAccess` | `checkAttachmentPermission` |
+| **Share Token** | ❌ 不支持 | ❌ 不支持 | ✅ 支持 |
+| **Public Memo 附件** | 网关层拒绝（无认证） | 网关层拒绝（无认证） | 服务层允许 |
+
+### 4.6 边界场景分析
+
+#### 场景 1：未登录用户访问 Public Memo 的附件
+
+**请求路径**: `GET /file/attachments/abc123/photo.jpg`
+
+**鉴权流程**:
+1. **网关层**: `runtime.RPCMethod()` 返回 `ok = false` → 放行
+2. **服务层** (`checkAttachmentPermission`):
+   - `attachment.MemoID != nil` → 关联了 Memo
+   - `memo.Visibility == Public` → 返回 `nil`（允许）
+
+**结果**: ✅ 访问成功
+
+**对比**：如果通过 API 层 `GetAttachment` 访问：
+- 网关层：`AttachmentService` 不在白名单 → 需要认证
+- 未登录请求直接返回 `Unauthenticated`
+
+#### 场景 2：使用 Share Token 访问 Private Memo 的附件
+
+**请求路径**: `GET /file/attachments/abc123/photo.jpg?share_token=xyz789`
+
+**鉴权流程**:
+1. **网关层**: 放行
+2. **服务层**:
+   - `memo.Visibility == Private`
+   - 检查 `share_token` 参数
+   - Token 有效且对应正确的 Memo → 允许访问
+
+**结果**: ✅ 访问成功
+
+**对比**：API 层 `GetAttachment` 不支持 `share_token` 参数，无法通过此方式访问。
+
+#### 场景 3：未登录用户访问未绑定的附件
+
+**请求路径**: `GET /file/attachments/abc123/photo.jpg`（附件 `MemoID = nil`）
+
+**鉴权流程**:
+1. **网关层**: 放行
+2. **服务层**:
+   - `attachment.MemoID == nil`
+   - `getCurrentUser()` 返回 `nil`（未登录）
+   - 返回 `Unauthorized`
+
+**结果**: ❌ 访问被拒绝
+
+### 4.7 鉴权边界总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         鉴权边界关键差异                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  网关层 vs 服务层的分工:                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │   网关层 (AuthInterceptor / gatewayAuthMiddleware)                   │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐   │  │
+│  │   │  职责: 认证凭证验证（是否登录）                                │   │  │
+│  │   │  依据: PublicMethods 白名单                                   │   │  │
+│  │   │  特点: 粗粒度，只区分"公开/非公开"方法                        │   │  │
+│  │   └──────────────────────────────────────────────────────────────┘   │  │
+│  │                              ↓                                         │  │
+│  │   服务层 (checkAttachmentAccess / checkAttachmentPermission)          │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐   │  │
+│  │   │  职责: 具体业务权限检查                                        │   │  │
+│  │   │  依据: 附件状态、Memo 可见性、用户身份、Share Token           │   │  │
+│  │   │  特点: 细粒度，完整的权限决策逻辑                              │   │  │
+│  │   └──────────────────────────────────────────────────────────────┘   │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  文件服务的特殊性:                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │   由于 /file/* 路径无法被 grpc-gateway 识别为标准 RPC 方法，        │  │
+│  │   网关层会放行所有请求，完全依赖服务层的权限检查。                    │  │
+│  │                                                                       │  │
+│  │   这导致了一个重要的边界差异:                                        │  │
+│   │                                                                       │  │
+│  │   - Public Memo 的附件: 通过文件服务可匿名访问                       │  │
+│  │   - 通过 API GetAttachment: 需要先登录（网关层拦截）                 │  │
+│  │                                                                       │  │
+│  │   设计意图:                                                           │  │
+│  │   - 文件服务用于直接嵌入到网页、邮件中的资源链接                      │  │
+│  │   - 这些场景下用户可能没有登录状态                                    │  │
+│  │   - 但业务权限仍由服务层严格控制                                      │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 五、删除权限：单个 vs 批量操作的差异
+
+### 5.1 单个删除 (DeleteAttachment)
+
+**文件位置**: `server/router/api/v1/attachment_service.go:336-365`
+
+```go
+func (s *APIV1Service) DeleteAttachment(ctx context.Context, request *v1pb.DeleteAttachmentRequest) (*emptypb.Empty, error) {
+  attachmentUID, err := ExtractAttachmentUIDFromName(request.Name)
+  // ...
+  
+  user, err := s.fetchCurrentUser(ctx)
+  // ... 必须登录
+  
+  // 关键：查询时直接限制 CreatorID
+  attachment, err := s.Store.GetAttachment(ctx, &store.FindAttachment{
+    UID:       &attachmentUID,
+    CreatorID: &user.ID,  // ← 隐式权限控制
+  })
+  
+  if attachment == nil {
+    return nil, status.Errorf(codes.NotFound, "attachment not found")
+  }
+  
+  // 删除操作
+  s.Store.DeleteAttachment(ctx, &store.DeleteAttachment{ID: attachment.ID})
+  
+  return &emptypb.Empty{}, nil
+}
+```
+
+**核心特点**：
+1. **隐式权限控制**：通过查询条件 `CreatorID = user.ID` 实现
+2. **管理员也受限**：即使是管理员，查询时也被限制为只能查找自己创建的附件
+3. **错误类型**：尝试删除他人附件时返回 `NotFound`，不是 `PermissionDenied`
+
+### 5.2 批量删除 (BatchDeleteAttachments)
+
+**文件位置**: `server/router/api/v1/attachment_service.go:367-415`
+
+```go
+func (s *APIV1Service) BatchDeleteAttachments(ctx context.Context, request *v1pb.BatchDeleteAttachmentsRequest) (*emptypb.Empty, error) {
+  user, err := s.fetchCurrentUser(ctx)
+  // ... 必须登录
+  
+  attachments := make([]*store.Attachment, 0, len(request.Names))
+  
+  for _, name := range request.Names {
+    attachmentUID, _ := ExtractAttachmentUIDFromName(name)
+    
+    // 关键：查询时不限制 CreatorID
+    attachment, err := s.Store.GetAttachment(ctx, &store.FindAttachment{UID: &attachmentUID})
+    // ...
+    
+    // 显式权限检查
+    if attachment.CreatorID != user.ID && !isSuperUser(user) {
+      return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+    }
+    
+    attachments = append(attachments, attachment)
+  }
+  
+  // 批量删除
+  s.Store.DeleteAttachments(ctx, attachments)
+  
+  return &emptypb.Empty{}, nil
+}
+```
+
+**核心特点**：
+1. **显式权限控制**：查询后单独检查 `attachment.CreatorID != user.ID && !isSuperUser(user)`
+2. **管理员有权限**：管理员可以删除任意用户的附件
+3. **错误类型**：权限不足时返回 `PermissionDenied`
+
+### 5.3 两种删除方式对比
+
+| 维度 | 单个删除 (DeleteAttachment) | 批量删除 (BatchDeleteAttachments) |
+|------|----------------------------|-----------------------------------|
+| **查询条件** | `UID + CreatorID = user.ID` | 仅 `UID` |
+| **权限控制方式** | 隐式（查询条件过滤） | 显式（查询后检查） |
+| **管理员能力** | ❌ 无法删除他人附件 | ✅ 可以删除任意附件 |
+| **越权时返回** | `NotFound` (5) | `PermissionDenied` (7) |
+| **原子性** | 单条操作 | 全有或全无（循环中任一失败则全部终止） |
+| **适用场景** | 用户自主管理个人附件 | 管理员批量管理、用户清理自己的多个附件 |
+
+### 5.4 行为差异流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    删除权限行为差异                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  单个删除 (DeleteAttachment):                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                      │  │
+│  │   请求: DELETE /memos.api.v1.AttachmentService/DeleteAttachment    │  │
+│  │   参数: name = "attachments/att_other_user"                        │  │
+│  │                                                                      │  │
+│  │                              ↓                                       │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐  │  │
+│  │   │  Store.GetAttachment(ctx, &FindAttachment{                   │  │  │
+│  │   │      UID:       &attachmentUID,                               │  │  │
+│  │   │      CreatorID: &user.ID,  // ← 关键：只能查自己的           │  │  │
+│  │   │  })                                                           │  │  │
+│  │   └─────────────────────────────────────────────────────────────┘  │  │
+│  │                              ↓                                       │  │
+│  │   结果: attachment == nil                                           │  │
+│  │   返回: NotFound ("attachment not found")                           │  │
+│  │                                                                      │  │
+│  │   注意: 管理员执行此 API 也会得到同样结果！                         │  │
+│  │                                                                      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  批量删除 (BatchDeleteAttachments):                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                      │  │
+│  │   请求: POST /memos.api.v1.AttachmentService/BatchDeleteAttachments│  │
+│  │   参数: names = ["attachments/att_other_user"]                     │  │
+│  │                                                                      │  │
+│  │                              ↓                                       │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐  │  │
+│  │   │  Store.GetAttachment(ctx, &FindAttachment{                   │  │  │
+│  │   │      UID: &attachmentUID,  // ← 不限制 CreatorID            │  │  │
+│  │   │  })                                                           │  │  │
+│  │   └─────────────────────────────────────────────────────────────┘  │  │
+│  │                              ↓                                       │  │
+│  │   结果: attachment != nil (找到了)                                  │  │
+│  │                              ↓                                       │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐  │  │
+│  │   │  显式检查:                                                    │  │  │
+│  │   │  if attachment.CreatorID != user.ID && !isSuperUser(user) { │  │  │
+│  │   │      return PermissionDenied                                 │  │  │
+│  │   │  }                                                           │  │  │
+│  │   └─────────────────────────────────────────────────────────────┘  │  │
+│  │                              ↓                                       │  │
+│  │   普通用户: 返回 PermissionDenied                                   │  │
+│  │   管理员:   检查通过 → 执行删除                                     │  │
+│  │                                                                      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.5 管理员删除附件的正确方式
+
+由于 `DeleteAttachment` API 限制了只能删除自己的附件，管理员需要使用 `BatchDeleteAttachments` 来删除其他用户的附件：
+
+```go
+// 管理员删除他人附件的正确姿势：
+
+// ❌ 错误方式：DeleteAttachment 会返回 NotFound
+s.DeleteAttachment(ctx, &v1pb.DeleteAttachmentRequest{
+  Name: "attachments/att_other_user",
+})
+// 结果: NotFound (因为查询时加了 CreatorID 限制)
+
+// ✅ 正确方式：使用 BatchDeleteAttachments
+s.BatchDeleteAttachments(ctx, &v1pb.BatchDeleteAttachmentsRequest{
+  Names: []string{"attachments/att_other_user"},
+})
+// 结果: 
+// - 管理员: 删除成功
+// - 普通用户: PermissionDenied
+```
+
+### 5.6 设计意图分析
+
+**为什么单个删除和批量删除有不同的权限模型？**
+
+| 设计考量 | 单个删除 | 批量删除 |
+|---------|---------|---------|
+| **使用场景** | 用户在 UI 中删除单个附件 | 管理员后台操作、用户批量清理 |
+| **安全性** | 最严格的隐式控制，防止越权猜测 UID | 显式检查，兼顾管理员需求 |
+| **错误信息** | `NotFound` 不暴露附件是否存在 | `PermissionDenied` 明确告知权限不足 |
+| **原子性** | 天然单条操作 | 需要保证批量一致性 |
+
+**安全设计亮点**：
+1. 单个删除使用 `NotFound` 而不是 `PermissionDenied`，可以防止攻击者通过枚举 UID 来确认系统中是否存在某个附件（信息泄露防护）
+2. 批量删除用于管理员场景，需要明确的权限反馈，所以使用 `PermissionDenied`
+
+### 5.7 通过 SetMemoAttachments 间接删除
+
+**文件位置**: `server/router/api/v1/memo_attachment_service.go:71-84`
+
+还有一种删除附件的方式是通过 `SetMemoAttachments` 解绑时删除：
+
+```go
+// 删除不在请求中的附件（解绑即删除）
+for _, attachment := range currentAttachments {
+  if !requestedIDs[attachment.ID] {
+    // 权限检查：不能删除其他用户的附件
+    if attachment.CreatorID != user.ID && !isSuperUser(user) {
+      return status.Errorf(codes.PermissionDenied, "cannot remove another user's attachment")
+    }
+    // 执行删除
+    s.Store.DeleteAttachment(ctx, &store.DeleteAttachment{
+      ID:     int32(attachment.ID),
+      MemoID: &memo.ID,
+    })
+  }
+}
+```
+
+**特点**：
+- 权限模型与 `BatchDeleteAttachments` 一致：显式检查，管理员可以删除他人附件
+- 这是管理员可以删除已绑定到 Memo 的附件的另一种方式
+
+---
+
+## 六、资源访问控制逻辑（核心总结）
+
+### 6.1 访问入口
 
 资源访问有两个主要入口：
 
 1. **gRPC API 层**: 通过 `AttachmentService` 访问附件元数据
    - `GetAttachment` - 获取单个附件信息
    - `ListAttachments` - 列出用户的附件
+   - `ListMemoAttachments` - 列出 Memo 的附件
 
 2. **HTTP 文件服务器**: 直接访问文件内容
    - 路由: `/file/attachments/:uid/:filename`
    - 实现: `server/router/fileserver/fileserver.go`
 
-### 3.2 权限检查核心逻辑
+### 6.2 权限检查核心逻辑
 
-#### 3.2.1 HTTP 文件访问权限检查
+#### 6.2.1 HTTP 文件访问权限检查
 
 **文件位置**: `server/router/fileserver/fileserver.go:checkAttachmentPermission`
 
@@ -455,7 +1205,7 @@ func (s *FileServerService) checkAttachmentPermission(ctx context.Context, c *ec
 }
 ```
 
-#### 3.2.2 API 层权限检查
+#### 6.2.2 API 层权限检查
 
 **文件位置**: `server/router/api/v1/attachment_service.go:checkAttachmentAccess`
 
@@ -494,7 +1244,7 @@ func (s *APIV1Service) checkAttachmentAccess(ctx context.Context, attachment *st
 }
 ```
 
-### 3.3 权限决策矩阵
+### 6.3 权限决策矩阵
 
 | 附件类型 | 访问者身份 | Memo 可见性 | 是否有权限 |
 |----------|------------|-------------|------------|
@@ -510,7 +1260,7 @@ func (s *APIV1Service) checkAttachmentAccess(ctx context.Context, attachment *st
 | 关联 Memo | 管理员 | Private | ✅ 允许 |
 | 关联 Memo | 携带有效 Share Token | Protected/Private | ✅ 允许 |
 
-### 3.4 用户身份认证
+### 6.4 用户身份认证
 
 **文件位置**: `server/router/fileserver/fileserver.go:getCurrentUser`
 
@@ -527,7 +1277,7 @@ func (s *FileServerService) getCurrentUser(ctx context.Context, c *echo.Context)
 }
 ```
 
-### 3.5 公开端点配置
+### 6.5 公开端点配置
 
 **文件位置**: `server/router/api/v1/acl_config.go`
 
@@ -558,9 +1308,9 @@ var PublicMethods = map[string]struct{}{
 }
 ```
 
-### 3.6 文件服务安全防护
+### 6.6 文件服务安全防护
 
-#### 3.6.1 XSS 防护
+#### 6.6.1 XSS 防护
 
 对于可能执行脚本的 MIME 类型，强制下载而不是直接渲染：
 
@@ -583,7 +1333,7 @@ func sanitizeContentType(mimeType string) string {
 }
 ```
 
-#### 3.6.2 安全响应头
+#### 6.6.2 安全响应头
 
 所有文件响应都设置安全头：
 
@@ -596,7 +1346,7 @@ func setSecurityHeaders(c *echo.Context) {
 }
 ```
 
-#### 3.6.3 缓存控制
+#### 6.6.3 缓存控制
 
 ```go
 const cacheMaxAge = "public, max-age=3600"  // 1 小时缓存
@@ -615,9 +1365,9 @@ func setMediaHeaders(c *echo.Context, contentType, originalType string) {
 
 ---
 
-## 四、文件服务实现细节
+## 七、文件服务实现细节
 
-### 4.1 文件服务路由
+### 7.1 文件服务路由
 
 **文件位置**: `server/router/fileserver/fileserver.go`
 
@@ -629,7 +1379,7 @@ func (s *FileServerService) RegisterRoutes(echoServer *echo.Echo) {
 }
 ```
 
-### 4.2 附件文件服务流程
+### 7.2 附件文件服务流程
 
 ```go
 func (s *FileServerService) serveAttachmentFile(c *echo.Context) error {
@@ -667,9 +1417,9 @@ func (s *FileServerService) serveAttachmentFile(c *echo.Context) error {
 }
 ```
 
-### 4.3 不同存储类型的文件服务
+### 7.3 不同存储类型的文件服务
 
-#### 4.3.1 流式传输（视频/音频）
+#### 7.3.1 流式传输（视频/音频）
 
 ```go
 func (s *FileServerService) serveMediaStream(c *echo.Context, attachment *store.Attachment, contentType string) error {
@@ -696,7 +1446,7 @@ func (s *FileServerService) serveMediaStream(c *echo.Context, attachment *store.
 }
 ```
 
-#### 4.3.2 静态文件服务
+#### 7.3.2 静态文件服务
 
 ```go
 func (s *FileServerService) serveStaticFile(c *echo.Context, attachment *store.Attachment, contentType string, wantThumbnail bool) error {
@@ -730,7 +1480,7 @@ func (s *FileServerService) serveStaticFile(c *echo.Context, attachment *store.A
 }
 ```
 
-### 4.4 缩略图生成
+### 7.4 缩略图生成
 
 ```go
 func (s *FileServerService) getOrGenerateThumbnail(ctx context.Context, attachment *store.Attachment) ([]byte, error) {
@@ -771,7 +1521,7 @@ func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *s
 }
 ```
 
-### 4.5 动态照片（Motion Photo）支持
+### 7.5 动态照片（Motion Photo）支持
 
 系统支持 Android Motion Photo 和 Apple Live Photo：
 
@@ -794,205 +1544,8 @@ func (s *FileServerService) serveMotionClip(c *echo.Context, attachment *store.A
 
 ---
 
-## 五、附件数据模型
+## 八、附件数据模型
 
-### 5.1 Attachment 结构体
+### 8.1 Attachment 结构体
 
-**文件位置**: `store/attachment.go`
-
-```go
-type Attachment struct {
-  // 系统字段
-  ID        int32   // 内部主键
-  UID       string  // 对外唯一标识（URL 友好）
-  
-  // 标准字段
-  CreatorID int32   // 创建者用户 ID
-  CreatedTs int64   // 创建时间戳
-  UpdatedTs int64   // 更新时间戳
-  
-  // 业务字段
-  Filename    string                        // 文件名
-  Blob        []byte                        // 文件内容（仅 DATABASE 存储类型）
-  Type        string                        // MIME 类型
-  Size        int64                         // 文件大小（字节）
-  StorageType storepb.AttachmentStorageType // 存储类型: DATABASE/LOCAL/S3
-  Reference   string                        // 引用路径/URL
-  Payload     *storepb.AttachmentPayload    // 额外载荷（S3 配置、Motion Media 等）
-  
-  // 关联字段
-  MemoID  *int32   // 关联的 Memo ID（可选）
-  MemoUID *string  // 关联的 Memo UID（组合字段）
-}
-```
-
-### 5.2 AttachmentPayload 结构
-
-```protobuf
-message AttachmentPayload {
-  oneof payload {
-    S3Object s3_object = 1;
-    MotionMedia motion_media = 2;
-  }
-}
-
-message S3Object {
-  StorageS3Config s3_config = 1;      // S3 配置（用于刷新预签名 URL）
-  string key = 2;                      // 对象键
-  google.protobuf.Timestamp last_presigned_time = 3;  // 上次预签名时间
-}
-
-message MotionMedia {
-  MotionMediaFamily family = 1;        // ANDROID_MOTION_PHOTO / APPLE_LIVE_PHOTO
-  MotionMediaRole role = 2;            // CONTAINER / STILL / VIDEO
-  string group_id = 3;                  // 分组 ID（用于关联静态图和视频）
-  int64 presentation_timestamp_us = 4;  // 展示时间戳
-  bool has_embedded_video = 5;          // 是否包含内嵌视频
-}
-```
-
-### 5.3 存储类型枚举
-
-```protobuf
-enum AttachmentStorageType {
-  ATTACHMENT_STORAGE_TYPE_UNSPECIFIED = 0;
-  DATABASE = 1;  // 存储在数据库 BLOB
-  LOCAL = 2;     // 存储在本地文件系统
-  S3 = 3;        // 存储在 S3 兼容对象存储
-  EXTERNAL = 4;  // 外部链接（用户直接提供 URL）
-}
-```
-
----
-
-## 六、附件删除流程
-
-### 6.1 删除逻辑
-
-**文件位置**: `store/attachment.go`
-
-```go
-func (s *Store) DeleteAttachment(ctx context.Context, delete *DeleteAttachment) error {
-  // 1. 获取附件信息
-  attachment, err := s.GetAttachment(ctx, &FindAttachment{ID: &delete.ID})
-  
-  // 2. 删除存储中的文件（本地文件或 S3 对象）
-  if err := s.DeleteAttachmentStorage(ctx, attachment); err != nil {
-    if attachment.StorageType == storepb.AttachmentStorageType_LOCAL {
-      return errors.Wrap(err, "failed to delete local file")
-    }
-    // S3 删除失败仅记录警告，不阻断数据库删除
-    slog.Warn("Failed to delete attachment storage", slog.Any("err", err))
-  }
-  
-  // 3. 删除数据库记录
-  return s.driver.DeleteAttachment(ctx, delete)
-}
-```
-
-### 6.2 S3 对象删除
-
-```go
-func (s *Store) deleteAttachmentStorageImpl(ctx context.Context, attachment *Attachment, instanceStorageSetting *storepb.InstanceStorageSetting) error {
-  if attachment.StorageType == storepb.AttachmentStorageType_S3 {
-    s3ObjectPayload := attachment.Payload.GetS3Object()
-    
-    // 1. 获取 S3 配置
-    // - 优先使用 attachment 中保存的配置
-    // - 否则使用当前实例配置（兼容旧数据）
-    s3Config := s3ObjectPayload.S3Config
-    if s3Config == nil {
-      if instanceStorageSetting == nil {
-        instanceStorageSetting, _ = s.GetInstanceStorageSetting(ctx)
-      }
-      s3Config = instanceStorageSetting.S3Config
-    }
-    
-    // 2. 创建客户端并删除
-    s3Client, _ := s3.NewClient(ctx, s3Config)
-    s3Client.DeleteObject(ctx, s3ObjectPayload.Key)
-  }
-  
-  // 3. 删除衍生缓存（缩略图、动态照片视频）
-  s.deleteAttachmentDerivedCaches(attachment)
-  return nil
-}
-```
-
----
-
-## 七、关键配置项
-
-### 7.1 实例存储配置
-
-**文件位置**: `store/instance_setting.go`
-
-```go
-type InstanceStorageSetting struct {
-  StorageType          InstanceStorageSetting_StorageType  // LOCAL / S3
-  UploadSizeLimitMb    int32                               // 上传大小限制（MB）
-  FilepathTemplate     string                              // 路径模板
-  S3Config             *StorageS3Config                    // S3 配置（仅 S3 模式）
-}
-
-// 默认值
-const (
-  defaultInstanceStorageType       = storepb.InstanceStorageSetting_LOCAL
-  defaultInstanceUploadSizeLimitMb = 30
-  defaultInstanceFilepathTemplate  = "assets/{timestamp}_{uuid}_{filename}"
-)
-```
-
-### 7.2 上传缓冲区
-
-```go
-const (
-  MaxUploadBufferSizeBytes = 32 << 20  // 32 MiB 内存缓冲区
-  MebiByte                 = 1024 * 1024
-)
-```
-
----
-
-## 八、总结
-
-### 8.1 架构亮点
-
-1. **多存储抽象**: 通过统一的 `StorageType` 和 `Reference` 字段，透明支持数据库、本地文件、S3 三种存储方式
-2. **预签名 URL 自动刷新**: S3 模式下，后台任务定期刷新即将过期的预签名 URL，对用户无感知
-3. **灵活的权限模型**: 附件权限与关联的 Memo 可见性绑定，同时支持 Share Token 临时访问
-4. **隐私保护**: 图片自动剥离 EXIF 元数据，防止 GPS 位置等敏感信息泄露
-5. **安全防护**: XSS 类型强制下载、安全响应头、路径遍历防护
-
-### 8.2 数据流概览
-
-```
-上传流程:
-前端 → gRPC CreateAttachment → 验证 → EXIF剥离 → SaveAttachmentBlob (本地/S3) → 数据库记录
-
-访问流程:
-/file/attachments/:uid → 权限检查 → 按存储类型服务
-  - LOCAL: 直接读取文件
-  - S3: 重定向预签名URL 或 代理流式读取
-  - DATABASE: 从 BLOB 字段读取
-
-权限决策:
-未关联 Memo → 仅创建者/管理员
-已关联 Memo → Public: 任何人
-              Protected: 登录用户
-              Private: 创建者/管理员
-              + Share Token: 临时授权访问
-```
-
-### 8.3 关键文件索引
-
-| 功能 | 文件路径 |
-|------|----------|
-| 前端上传服务 | `web/src/components/MemoEditor/services/uploadService.ts` |
-| 附件 API 服务 | `server/router/api/v1/attachment_service.go` |
-| HTTP 文件服务器 | `server/router/fileserver/fileserver.go` |
-| S3 客户端实现 | `internal/storage/s3/s3.go` |
-| S3 预签名刷新 | `server/runner/s3presign/runner.go` |
-| 附件存储层 | `store/attachment.go` |
-| 实例配置管理 | `store/instance_setting.go` |
-| 公开端点 ACL | `server/router/api/v1/acl_config.go` |
+**文件位置**: `
