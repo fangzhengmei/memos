@@ -269,14 +269,66 @@ const AuthCallback = () => {
 
 ### 2. 错误回调场景汇总
 
+#### 2.1 通用错误 (登录模式和绑定模式共有)
+
 | 错误类型 | 触发条件 | 错误信息示例 |
 |---------|---------|-------------|
 | **OAuth 授权错误** | 用户拒绝授权、权限不足等 | `OAuth error: access_denied\nUser denied access` |
 | **参数缺失** | 回调 URL 缺少 `code` 或 `state` | `Missing authorization code or state parameter` |
 | **State 无效/过期** | state 不匹配或超过 10 分钟 | `Invalid or expired state parameter. This may indicate a CSRF attack attempt` |
 | **后端验证失败** | 令牌交换失败、用户信息获取失败 | `Failed to exchange token` / `Failed to get user info` |
+
+#### 2.2 登录模式特有错误
+
+| 错误类型 | 触发条件 | 错误信息示例 |
+|---------|---------|-------------|
 | **注册被禁用** | 首次登录但 `DisallowUserRegistration=true` | `user registration is not allowed` |
 | **身份已绑定他人** | 并发竞争或身份已绑定到其他用户 | `identity provider account is already linked to another user` |
+
+#### 2.3 绑定模式特有错误 (用户状态变化检测)
+
+**文件位置**: `web/src/pages/AuthCallback.tsx:85-91`
+
+| 错误类型 | 触发条件 | 错误信息示例 | 设计目的 |
+|---------|---------|-------------|---------|
+| **当前用户未登录** | 发起绑定后，在 OAuth 跳转期间用户登录状态丢失 (如 token 过期、手动登出) | `Failed to link account. Please sign in to Memos again and retry.` | 防止绑定操作在无用户上下文时执行 |
+| **用户身份已切换** | 发起绑定后，在 OAuth 跳转期间用户切换了账号 (如在另一标签页登出后用其他账号登录) | `The signed-in user changed before the OAuth callback completed. Please retry linking from account settings.` | **关键安全检查**: 防止外部身份被绑定到错误的用户账号 |
+
+#### 2.4 绑定模式错误场景详解
+
+**场景 1: 用户在 OAuth 跳转期间登出**
+```
+时间线:
+1. 用户 A 登录系统，进入设置页面
+2. 用户 A 点击 "绑定 GitHub 账号"，系统生成 state 并存入 sessionStorage
+   state 中包含: linkingUserName = "users/123" (用户 A 的标识)
+3. 页面跳转到 GitHub 授权页面
+4. 用户 A 在另一标签页手动登出系统 (或 token 过期)
+5. 用户 A 在 GitHub 完成授权，回调到 /auth/callback
+6. 回调页面检查: currentUser?.name → undefined (用户未登录)
+7. 抛出错误: "Failed to link account. Please sign in to Memos again and retry."
+```
+
+**场景 2: 用户在 OAuth 跳转期间切换账号**
+```
+时间线:
+1. 用户 A 登录系统，进入设置页面
+2. 用户 A 点击 "绑定 GitHub 账号"，系统生成 state
+   state 中包含: linkingUserName = "users/123" (用户 A 的标识)
+3. 页面跳转到 GitHub 授权页面
+4. 用户 A 在另一标签页登出，然后用用户 B 的账号重新登录
+5. 用户 A 在 GitHub 完成授权，回调到 /auth/callback
+6. 回调页面检查:
+   - currentUser.name = "users/456" (用户 B 的标识)
+   - linkingUserName = "users/123" (发起绑定时的用户 A)
+   - 检查: linkingUserName && currentUser.name !== linkingUserName → true
+7. 抛出错误: "The signed-in user changed before the OAuth callback completed..."
+```
+
+**设计意图**:
+- OAuth 流程是跨站点的，用户可能在跳转期间在其他标签页操作
+- 如果不做此检查，用户 A 的 GitHub 身份可能会被错误地绑定到用户 B
+- 这是一个**安全防护机制**，确保绑定操作的用户一致性
 
 ---
 
@@ -774,14 +826,14 @@ if instanceGeneralSetting.DisallowUserRegistration {
 }
 ```
 
-### 4. 开关组合场景
+#### 3.3 开关组合场景 (统一结论)
 
-| 配置组合 | 可用登录方式 | 说明 |
-|---------|-------------|------|
-| `DisallowPasswordAuth=false`<br>`DisallowUserRegistration=false` | 密码登录 + SSO 登录 + 用户注册 | 默认配置 |
-| `DisallowPasswordAuth=true`<br>`DisallowUserRegistration=false` | SSO 登录 + 新用户自动注册 | 强制 SSO，新用户通过 SSO 首次登录自动创建账号 |
-| `DisallowPasswordAuth=false`<br>`DisallowUserRegistration=true` | 密码登录 (已有用户) + SSO 登录 (仅绑定用户) | 禁止新用户注册，SSO 仅允许已绑定的用户登录 |
-| `DisallowPasswordAuth=true`<br>`DisallowUserRegistration=true` | SSO 登录 (仅绑定用户) | 最严格模式，仅已绑定 SSO 身份的用户可登录 |
+| 配置组合 | 普通用户可用登录方式 | 管理员可用登录方式 | 统一结论说明 |
+|---------|---------------------|-------------------|-------------|
+| `DisallowPasswordAuth=false`<br>`DisallowUserRegistration=false` | 密码登录 + SSO 登录 + 用户注册 | 密码登录 + SSO 登录 + 用户注册 | **默认配置**<br>所有用户可自由选择登录方式 |
+| `DisallowPasswordAuth=true`<br>`DisallowUserRegistration=false` | SSO 登录 + 新用户自动注册 | 密码登录 + SSO 登录 + 新用户自动注册 | **强制 SSO 模式**<br>普通用户：只能用 SSO，新用户首次登录自动创建账号<br>**管理员例外入口**：仍可使用密码登录，防止被锁定在系统外 |
+| `DisallowPasswordAuth=false`<br>`DisallowUserRegistration=true` | 密码登录 (已有用户) + SSO 登录 (仅绑定用户) | 密码登录 (已有用户) + SSO 登录 (仅绑定用户) | **封闭注册模式**<br>禁止新用户注册<br>SSO 仅允许已绑定身份的用户登录<br>管理员和普通用户规则相同 |
+| `DisallowPasswordAuth=true`<br>`DisallowUserRegistration=true` | SSO 登录 (仅绑定用户) | 密码登录 + SSO 登录 (仅绑定用户) | **最严格模式**<br>普通用户：仅已绑定 SSO 身份的用户可登录<br>**管理员例外入口**：仍可使用密码登录，作为紧急维护入口 |
 
 ---
 
