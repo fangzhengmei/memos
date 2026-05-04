@@ -21,33 +21,173 @@
 | **更新附件** | `dispatchMemoUpdatedSideEffects()` | `memos.memo.updated` | `memo_attachment_service.go:48` |
 | **更新关系** | `dispatchMemoUpdatedSideEffects()` | `memos.memo.updated` | `memo_relation_service.go:48` |
 
-#### 1.1.2 触发流程示例（创建 Memo）
+#### 1.1.2 触发流程
 
 ```
-CreateMemo()
+dispatchMemoRelatedWebhook(ctx, memo, activityType)
     │
-    ├── 1. 验证用户权限
-    ├── 2. 构建 Memo 数据
-    ├── 3. 解析 Markdown payload
-    ├── 4. 写入数据库
-    ├── 5. 设置附件/关系
-    ├── 6. 转换为 API 响应格式
+    ├── 1. ResolveUserByName() → 获取 Memo 创建者
+    ├── 2. Store.GetUserWebhooks() → 获取该用户配置的所有 webhooks
     │
-    ├── 7. DispatchMemoCreatedWebhook() ← 触发 webhook
-    │   │
-    │   └── dispatchMemoRelatedWebhook()
-    │       ├── 获取 Memo 创建者
-    │       ├── 获取该用户的所有 webhooks
-    │       ├── 遍历 webhooks，构建 payload
-    │       └── webhook.PostAsync() ← 异步发送
-    │
-    ├── 8. SSEHub.Broadcast() ← 实时推送通知
-    └── 9. 返回结果
+    └── 3. 遍历 webhooks:
+           │
+           ├── convertMemoToWebhookPayload(memo)
+           │       └── 返回 WebhookRequestPayload{Creator, Memo}
+           │
+           ├── payload.ActivityType = activityType
+           ├── payload.URL = hook.Url
+           │
+           └── webhook.PostAsync(payload)
 ```
 
-### 1.2 异步发送实现
+### 1.2 请求体实际字段（重要！）
 
-#### 1.2.1 异步队列机制
+#### 1.2.1 数据结构
+
+```go
+// internal/webhook/webhook.go
+type WebhookRequestPayload struct {
+    URL          string       `json:"url"`           // ⚠️ 注意：有 json tag，会被序列化！
+    ActivityType string       `json:"activityType"`
+    Creator      string       `json:"creator"`
+    Memo         *v1pb.Memo   `json:"memo"`
+}
+```
+
+#### 1.2.2 实际发送逻辑
+
+```go
+// Post 函数内部
+body, err := json.Marshal(requestPayload)  // ⚠️ 序列化整个结构体！
+
+req, err := http.NewRequest("POST", requestPayload.URL, bytes.NewBuffer(body))
+```
+
+**关键点**：`json.Marshal(requestPayload)` 会序列化**所有字段**，包括 `url`！
+
+#### 1.2.3 实际请求体示例
+
+```json
+POST <webhook-configured-url>
+Content-Type: application/json
+
+{
+    "url": "https://example.com/webhook-endpoint",
+    "activityType": "memos.memo.created",
+    "creator": "users/steven",
+    "memo": {
+        "name": "memos/abc123",
+        "state": "NORMAL",
+        "creator": "users/steven",
+        "create_time": "2025-05-05T10:00:00Z",
+        "update_time": "2025-05-05T10:00:00Z",
+        "content": "#work Meeting notes\n- Item 1",
+        "visibility": "PRIVATE",
+        "tags": ["work"],
+        "pinned": false,
+        "attachments": [],
+        "relations": []
+    }
+}
+```
+
+**注意**：
+- `url` 字段**会被发送**，值是用户配置的 webhook URL
+- `memo` 字段是完整的 `v1pb.Memo` 对象，包含所有 API 可见字段
+
+### 1.3 成功判定条件（重要！）
+
+#### 1.3.1 判定逻辑
+
+```go
+// internal/webhook/webhook.go:96-121
+resp, err := safeClient.Do(req)
+// ...
+
+// 条件 1: HTTP 状态码必须在 200-299 之间
+if resp.StatusCode < 200 || resp.StatusCode > 299 {
+    return errors.Errorf("failed to post webhook %s, status code: %d", requestPayload.URL, resp.StatusCode)
+}
+
+// 条件 2: 响应体必须能反序列化为 {code, message} 结构
+response := &struct {
+    Code    int    `json:"code"`
+    Message string `json:"message"`
+}{}
+if err := json.Unmarshal(b, response); err != nil {
+    // ⚠️ 注意：如果响应体不是有效的 JSON，或者没有 code 字段，这里会报错！
+    return errors.Wrapf(err, "failed to unmarshal webhook response from %s", requestPayload.URL)
+}
+
+// 条件 3: code 必须等于 0
+if response.Code != 0 {
+    return errors.Errorf("receive error code sent by webhook server, code %d, msg: %s", response.Code, response.Message)
+}
+```
+
+#### 1.3.2 外部服务必须返回的格式
+
+**✅ 正确的响应（成功）：**
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+    "code": 0,
+    "message": "success"
+}
+```
+
+**❌ 错误的响应（会失败）：**
+
+```json
+// 失败 1: 空响应体
+// → json.Unmarshal 失败
+
+// 失败 2: 纯文本
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+OK
+// → json.Unmarshal 失败
+
+// 失败 3: 没有 code 字段
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+    "status": "ok"
+}
+// → 虽然能 Unmarshal，但 response.Code 是默认值 0
+// ⚠️ 注意：这种情况实际上会"成功"，因为 Go 结构体默认值是 0
+
+// 失败 4: code 非 0
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+    "code": 1,
+    "message": "something went wrong"
+}
+// → 失败，因为 code != 0
+```
+
+#### 1.3.3 特殊情况说明
+
+如果外部服务返回的 JSON 不包含 `code` 字段：
+```json
+{
+    "message": "hello"
+}
+```
+
+`json.Unmarshal` 会成功，但 `response.Code` 会是 Go `int` 类型的默认值 `0`，所以会被判定为**成功**。
+
+这是一个潜在的"漏洞"，但也是 Go JSON 反序列化的标准行为。
+
+### 1.4 异步发送实现
+
+#### 1.4.1 异步队列机制
 
 ```go
 // internal/webhook/webhook.go
@@ -61,7 +201,10 @@ func init() {
         go func() {
             for payload := range asyncPostQueue {
                 if err := Post(payload); err != nil {
-                    slog.Warn("Failed to dispatch webhook asynchronously", ...)
+                    slog.Warn("Failed to dispatch webhook asynchronously",
+                        slog.String("url", payload.URL),
+                        slog.String("activityType", payload.ActivityType),
+                        slog.Any("err", err))
                 }
             }
         }()
@@ -69,15 +212,29 @@ func init() {
 }
 ```
 
-#### 1.2.2 投递失败处理
+#### 1.4.2 PostAsync 投递逻辑
 
-- **队列满时丢弃**：当队列满时，新的 webhook 请求会被丢弃并记录警告日志
-- **单条失败不影响其他**：每个 webhook 独立处理，单个失败不会影响同批次的其他 webhook
-- **仅记录日志**：失败后仅记录日志，没有重试机制
+```go
+func PostAsync(requestPayload *WebhookRequestPayload) {
+    if requestPayload == nil {
+        slog.Warn("Dropped webhook dispatch because payload is nil")
+        return
+    }
+    select {
+    case asyncPostQueue <- requestPayload:
+        // 成功入队
+    default:
+        // 队列满，丢弃并记录警告
+        slog.Warn("Dropped webhook dispatch because the async queue is full",
+            slog.String("url", requestPayload.URL),
+            slog.String("activityType", requestPayload.ActivityType))
+    }
+}
+```
 
-### 1.3 安全机制
+### 1.5 安全机制
 
-#### 1.3.1 SSRF 防护
+#### 1.5.1 SSRF 防护
 
 ```go
 // internal/webhook/validate.go
@@ -94,7 +251,7 @@ var reservedCIDRs = []string{
     "fe80::/10",      // IPv6 链路本地
 }
 
-// 连接时验证 IP
+// 连接时验证 IP（在 Dial 阶段）
 func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
     // 解析 hostname
     ips, err := net.DefaultResolver.LookupHost(ctx, host)
@@ -108,14 +265,14 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 }
 ```
 
-#### 1.3.2 可配置的安全开关
+#### 1.5.2 可配置的安全开关
 
 ```go
 // 允许私有 IP（用于本地部署场景）
 var AllowPrivateIPs bool
 ```
 
-#### 1.3.3 URL 验证
+#### 1.5.3 URL 验证（创建 webhook 时）
 
 ```go
 func ValidateURL(rawURL string) error {
@@ -140,283 +297,204 @@ func ValidateURL(rawURL string) error {
 }
 ```
 
-### 1.4 请求/响应格式
-
-#### 1.4.1 Webhook Payload 结构
-
-```go
-// internal/webhook/webhook.go
-type WebhookRequestPayload struct {
-    URL          string       `json:"url"`           // 目标 URL（不在请求体中发送）
-    ActivityType string       `json:"activityType"`  // 事件类型
-    Creator      string       `json:"creator"`       // 创建者资源名，如 "users/steven"
-    Memo         *v1pb.Memo   `json:"memo"`          // 完整的 Memo 对象
-}
-```
-
-#### 1.4.2 发送格式
-
-- **HTTP 方法**：POST
-- **Content-Type**：application/json
-- **超时**：30 秒
-- **请求体**：`WebhookRequestPayload` 的 JSON 序列化（不包含 `url` 字段）
-
-#### 1.4.3 响应验证
-
-外部服务返回的响应必须满足：
-
-1. **HTTP 状态码**：2xx
-2. **响应体格式**：
-```json
-{
-    "code": 0,
-    "message": "success"
-}
-```
-3. **code 必须为 0**，否则视为失败
-
-### 1.5 Webhook 配置管理
-
-#### 1.5.1 配置存储
-
-Webhook 配置存储在 **用户设置** 中，通过 `UserSetting` 实体管理：
-
-- **Key**：`WEBHOOKS`（`storepb.UserSetting_WEBHOOKS`）
-- **存储位置**：用户设置表
-
-#### 1.5.2 API 接口（来自 `user_service.proto`）
-
-| RPC 方法 | HTTP 方法 | 路径 | 功能 |
-|----------|-----------|------|------|
-| `ListUserWebhooks` | GET | `/api/v1/{parent=users/*}/webhooks` | 列出用户的所有 webhook |
-| `CreateUserWebhook` | POST | `/api/v1/{parent=users/*}/webhooks` | 创建新 webhook |
-| `UpdateUserWebhook` | PATCH | `/api/v1/{webhook.name=users/*/webhooks/*}` | 更新 webhook |
-| `DeleteUserWebhook` | DELETE | `/api/v1/{name=users/*/webhooks/*}` | 删除 webhook |
-
-#### 1.5.3 数据结构
-
-```protobuf
-// proto/api/v1/user_service.proto
-message UserWebhook {
-    string name = 1;           // 资源名，格式: users/{user}/webhooks/{webhook}
-    string url = 2;            // 目标 URL
-    string display_name = 3;   // 可选：显示名称
-    google.protobuf.Timestamp create_time = 4;
-    google.protobuf.Timestamp update_time = 5;
-}
-```
-
 ---
 
-## 二、外部输入机制（外部自动化 → 系统）
+## 二、向内输入与事件触发的共用路径（重要！）
 
-### 2.1 主要输入通道
+### 2.1 核心发现：REST 和 MCP 共用同一路径
 
-Memos 系统提供三种主要的外部自动化输入方式：
+#### 2.1.1 架构说明
 
-1. **REST API（Connect RPC）**：标准 HTTP API
-2. **MCP 协议**：AI 助手专用协议
-3. **PAT 认证**：长期访问令牌
-
-### 2.2 REST API（Connect RPC）
-
-#### 2.2.1 核心 Memo 操作 API
-
-| 操作 | RPC 方法 | HTTP | 路径 |
-|------|----------|------|------|
-| **创建** | `CreateMemo` | POST | `/api/v1/memos` |
-| **更新** | `UpdateMemo` | PATCH | `/api/v1/memos/{memo.name}` |
-| **删除** | `DeleteMemo` | DELETE | `/api/v1/memos/{name}` |
-| **查询单条** | `GetMemo` | GET | `/api/v1/memos/{name}` |
-| **查询列表** | `ListMemos` | GET | `/api/v1/memos` |
-| **创建评论** | `CreateMemoComment` | POST | `/api/v1/memos/{name}:createComment` |
-
-#### 2.2.2 API 请求示例
-
-**创建 Memo：**
-```bash
-POST /api/v1/memos
-Content-Type: application/json
-Authorization: Bearer <token>
-
-{
-    "memo": {
-        "content": "#work Meeting notes\n- Item 1\n- Item 2",
-        "visibility": "PRIVATE"
-    }
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        外部输入入口                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────┐           ┌──────────────────┐           │
+│  │   REST API       │           │    MCP 协议      │           │
+│  │  (Connect RPC)   │           │  (AI 助手专用)   │           │
+│  └────────┬─────────┘           └────────┬─────────┘           │
+│           │                               │                       │
+│           │ 1. HTTP 请求                  │ 1. HTTP + SSE        │
+│           │ 2. Connect RPC 反序列化       │ 2. MCP 消息解析      │
+│           │                               │                       │
+│           └───────────────┬───────────────┘                       │
+│                           │                                          │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │              APIV1Service 核心业务逻辑                    │     │
+│  │                    (共用路径)                             │     │
+│  │                                                           │     │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │     │
+│  │  │CreateMemo() │ │UpdateMemo() │ │DeleteMemo() │        │     │
+│  │  │SetAttachment│ │SetRelation  │ │CreateComment│        │     │
+│  │  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │     │
+│  │         │               │               │                 │     │
+│  │         ▼               ▼               ▼                 │     │
+│  │  ┌──────────────────────────────────────────────────┐    │     │
+│  │  │              副作用触发层                         │    │     │
+│  │  │                                                   │    │     │
+│  │  │  1. DispatchMemo*Webhook()  → 向外发送 webhook  │    │     │
+│  │  │  2. SSEHub.Broadcast()       → 实时推送通知      │    │     │
+│  │  │  3. dispatchMentionNotifications → 提及通知      │    │     │
+│  │  └──────────────────────────────────────────────────┘    │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**更新 Memo：**
-```bash
-PATCH /api/v1/memos/abc123
-Content-Type: application/json
-Authorization: Bearer <token>
-
-{
-    "memo": {
-        "name": "memos/abc123",
-        "content": "Updated content"
-    },
-    "update_mask": {
-        "paths": ["content"]
-    }
-}
-```
-
-### 2.3 MCP 协议（AI 助手集成）
-
-#### 2.3.1 MCP 服务器概述
-
-Memos 内置了完整的 **MCP（Model Context Protocol）** 服务器，允许 AI 助手（如 Claude Desktop）直接操作 Memos 数据。
-
-- **端点**：`/mcp`
-- **认证**：通过 `Authorization` 头（PAT 或 JWT）
-- **协议**：HTTP + SSE（可流式）
-
-#### 2.3.2 MCP 路由配置
+#### 2.1.2 MCP 工具如何调用共用路径
 
 ```go
-// server/router/mcp/mcp.go
-func (s *MCPService) RegisterRoutes(echoServer *echo.Echo) {
+// server/router/mcp/tools_memo.go
+
+func (s *MCPService) handleCreateMemo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    // ... 参数解析 ...
+
+    // ⚠️ 关键：直接调用 APIV1Service 的方法！
+    created, err := s.apiV1Service.CreateMemo(ctx, &v1pb.CreateMemoRequest{
+        Memo: &v1pb.Memo{
+            Content:    content,
+            Visibility: visibilityToProto(visibility),
+        },
+    })
     // ...
-    mcpGroup.Any("/mcp", echo.WrapHandler(httpHandler))
-    mcpGroup.Any("/mcp/readonly", echo.WrapHandler(httpHandler))
-    mcpGroup.Any("/mcp/x/:toolsets", echo.WrapHandler(httpHandler))
-    mcpGroup.Any("/mcp/x/:toolsets/readonly", echo.WrapHandler(httpHandler))
 }
-```
 
-#### 2.3.3 MCP 工具列表
+func (s *MCPService) handleUpdateMemo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    // ...
+    // ⚠️ 同样调用 APIV1Service.UpdateMemo()
+    updated, err := s.apiV1Service.UpdateMemo(ctx, &v1pb.UpdateMemoRequest{
+        Memo:       update,
+        UpdateMask: updateMask,
+    })
+    // ...
+}
 
-**Memo 操作工具**（`tools_memo.go`）：
-
-| 工具名 | 功能 | 是否修改数据 |
-|--------|------|--------------|
-| `list_memos` | 列出可见的 memo | 否 |
-| `get_memo` | 获取单个 memo | 否 |
-| `create_memo` | 创建新 memo | **是** |
-| `update_memo` | 更新 memo | **是** |
-| `delete_memo` | 删除 memo | **是** |
-| `search_memos` | 搜索 memo 内容 | 否 |
-| `list_memo_comments` | 列出评论 | 否 |
-| `create_memo_comment` | 创建评论 | **是** |
-
-**其他工具**：
-- `tools_tag.go`：标签操作
-- `tools_attachment.go`：附件操作
-- `tools_relation.go`：关系操作
-- `tools_reaction.go`：反应操作
-- `resources_memo.go`：Memo 资源
-- `prompts.go`：内置提示词
-
-#### 2.3.4 MCP 认证流程
-
-```go
-// server/router/mcp/mcp.go
-mcpGroup.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-    return func(c *echo.Context) error {
-        // 从 Authorization 头获取 token
-        authHeader := c.Request().Header.Get("Authorization")
-        if authHeader != "" {
-            // 使用 Authenticator 验证 token（支持 PAT 和 JWT）
-            result := s.authenticator.Authenticate(c.Request().Context(), authHeader)
-            if result == nil {
-                return c.JSON(http.StatusUnauthorized, ...)
-            }
-            // 将用户信息注入 context
-            ctx := auth.ApplyToContext(c.Request().Context(), result)
-            c.SetRequest(c.Request().WithContext(ctx))
-        }
-        return next(c)
+func (s *MCPService) handleDeleteMemo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    // ...
+    // ⚠️ 同样调用 APIV1Service.DeleteMemo()
+    if _, err := s.apiV1Service.DeleteMemo(ctx, &v1pb.DeleteMemoRequest{Name: "memos/" + uid}); err != nil {
+        // ...
     }
-})
-```
+    // ...
+}
 
-#### 2.3.5 MCP 安全特性
-
-1. **只读模式**：
-   - 路径 `/mcp/readonly` 或 `X-MCP-Readonly: true` 头
-   - 禁用所有修改类工具（`create_memo`, `update_memo`, `delete_memo` 等）
-
-2. **工具集过滤**：
-   - `X-MCP-Toolsets` 头：指定可用工具集
-   - `X-MCP-Tools` 头：指定具体可用工具
-   - `X-MCP-Exclude-Tools` 头：排除特定工具
-
-3. **工具集定义**：
-   - `memo`：Memo 读写
-   - `tag`：标签操作
-   - `attachment`：附件操作
-   - `relation`：关系操作
-   - `reaction`：反应操作
-
-### 2.4 附件与资源变化
-
-#### 2.4.1 附件更新触发
-
-当 Memo 的附件发生变化时，会触发 `memos.memo.updated` webhook：
-
-```go
-// server/router/api/v1/memo_attachment_service.go:48
-func (s *APIV1Service) SetMemoAttachments(...) {
-    // ... 更新附件逻辑 ...
-    
-    // 触发更新副作用（包括 webhook）
-    s.dispatchMemoUpdatedSideEffects(ctx, updatedMemo, parentMemo, memoMessage)
+func (s *MCPService) handleCreateMemoComment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    // ...
+    // ⚠️ 同样调用 APIV1Service.CreateMemoComment()
+    comment, err := s.apiV1Service.CreateMemoComment(ctx, &v1pb.CreateMemoCommentRequest{
+        Name: "memos/" + uid,
+        Comment: &v1pb.Memo{
+            Content:    content,
+            Visibility: visibilityToProto(parent.Visibility),
+        },
+    })
+    // ...
 }
 ```
 
-#### 2.4.2 关系更新触发
+#### 2.1.3 共用路径的代码证据
+
+**CreateMemo 的 webhook 触发**（来自 `memo_service.go`）：
 
 ```go
-// server/router/api/v1/memo_relation_service.go:48
-func (s *APIV1Service) SetMemoRelations(...) {
-    // ... 更新关系逻辑 ...
+func (s *APIV1Service) CreateMemo(ctx context.Context, request *v1pb.CreateMemoRequest) (*v1pb.Memo, error) {
+    // ... 业务逻辑 ...
     
-    // 触发更新副作用
-    s.dispatchMemoUpdatedSideEffects(ctx, updatedMemo, parentMemo, memoMessage)
+    // 无论从 REST 还是 MCP 调用，都会执行到这里
+    if err := s.DispatchMemoCreatedWebhook(ctx, memoMessage); err != nil {
+        slog.Warn("Failed to dispatch memo created webhook", slog.Any("err", err))
+    }
+    
+    // 以及 SSE 广播
+    if !isSSESuppressed(ctx) {
+        s.SSEHub.Broadcast(&SSEEvent{
+            Type:       SSEEventMemoCreated,
+            Name:       memoMessage.Name,
+            Visibility: memo.Visibility,
+            CreatorID:  resolveSSECreatorID(memo, nil),
+        })
+    }
+    
+    return memoMessage, nil
 }
 ```
 
-### 2.5 PAT（Personal Access Token）认证
+**UpdateMemo 的 webhook 触发**：
 
-#### 2.5.1 PAT 用途
+```go
+func (s *APIV1Service) UpdateMemo(ctx context.Context, request *v1pb.UpdateMemoRequest) (*v1pb.Memo, error) {
+    // ... 业务逻辑 ...
+    
+    // 无论从 REST 还是 MCP 调用，都会执行到这里
+    s.dispatchMemoUpdatedSideEffects(ctx, memo, parentMemo, memoMessage)
+    
+    return memoMessage, nil
+}
 
-PAT 是长期有效的访问令牌，用于：
-- 脚本/自动化工具访问 API
+// dispatchMemoUpdatedSideEffects 实现
+func (s *APIV1Service) dispatchMemoUpdatedSideEffects(ctx context.Context, memo *store.Memo, parentMemo *store.Memo, memoMessage *v1pb.Memo) {
+    // 触发 webhook
+    if err := s.DispatchMemoUpdatedWebhook(ctx, memoMessage); err != nil {
+        slog.Warn("Failed to dispatch memo updated webhook", slog.Any("err", err))
+    }
+    
+    // 以及 SSE 广播
+    s.SSEHub.Broadcast(&SSEEvent{
+        Type:       SSEEventMemoUpdated,
+        Name:       memoMessage.Name,
+        Parent:     memoMessage.GetParent(),
+        Visibility: memo.Visibility,
+        CreatorID:  resolveSSECreatorID(memo, parentMemo),
+    })
+}
+```
+
+### 2.2 输入方式汇总
+
+#### 2.2.1 三种输入方式
+
+| 方式 | 协议 | 端点 | 认证 | 适用场景 |
+|------|------|------|------|----------|
+| **REST API** | HTTP + Connect RPC | `/api/v1/memos` 等 | JWT 或 PAT | 通用自动化、脚本 |
+| **MCP 协议** | HTTP + SSE | `/mcp` | JWT 或 PAT | AI 助手（Claude Desktop 等） |
+| **PAT 直接调用** | 任何 HTTP 客户端 | 任意 API 端点 | PAT 头 | 长期运行的服务 |
+
+#### 2.2.2 PAT（Personal Access Token）
+
+**用途**：
+- 长期有效的访问令牌
+- 无需用户交互的自动化场景
 - MCP 服务器认证
-- 移动应用认证
-- CLI 工具认证
+- REST API 认证
 
-#### 2.5.2 PAT 特性
+**格式**：
+- Token 值：`memos_pat_<random-string>`
+- HTTP 头：`Authorization: Bearer <token>`
 
-- **格式**：`memos_pat_` 前缀的随机字符串
-- **存储**：SHA-256 哈希存储在数据库
-- **过期**：可选过期时间（或永不过期）
-- **描述**：用户可添加描述用于标识
+**特性**：
+- SHA-256 哈希存储（明文仅在创建时显示一次）
+- 可选过期时间
+- 用户可添加描述用于标识
 
-#### 2.5.3 PAT 管理 API
+### 2.3 触发覆盖范围
 
-| 操作 | HTTP | 路径 |
-|------|------|------|
-| 列出 PAT | GET | `/api/v1/{parent=users/*}/personalAccessTokens` |
-| 创建 PAT | POST | `/api/v1/{parent=users/*}/personalAccessTokens` |
-| 删除 PAT | DELETE | `/api/v1/{name=users/*/personalAccessTokens/*}` |
+无论通过哪种方式输入，以下操作都会触发 webhook：
 
-#### 2.5.4 创建 PAT 响应
-
-```json
-{
-    "personal_access_token": {
-        "name": "users/steven/personalAccessTokens/abc123",
-        "description": "Automation script",
-        "expires_at": "2026-01-01T00:00:00Z",
-        "created_at": "2025-05-05T00:00:00Z"
-    },
-    "token": "memos_pat_xxxxxxxxxxxx"  // 仅在创建时返回一次！
-}
-```
+| 操作 | ActivityType | 触发条件 |
+|------|--------------|----------|
+| 创建 Memo | `memos.memo.created` | ✅ 总是触发 |
+| 更新 Memo 内容 | `memos.memo.updated` | ✅ 总是触发 |
+| 更新 Memo 可见性 | `memos.memo.updated` | ✅ 总是触发 |
+| 更新附件 | `memos.memo.updated` | ✅ 总是触发 |
+| 更新关系 | `memos.memo.updated` | ✅ 总是触发 |
+| 置顶/取消置顶 | `memos.memo.updated` | ✅ 总是触发 |
+| 归档/取消归档 | `memos.memo.updated` | ✅ 总是触发 |
+| 删除 Memo | `memos.memo.deleted` | ✅ 总是触发 |
+| 创建评论 | `memos.memo.comment.created` | ✅ 发送给**原帖作者**（不是评论者） |
+| 添加/删除反应 | - | ❌ 不触发 |
+| 添加/删除标签 | - | ❌ 不触发（标签是 payload 的一部分，更新内容时才会触发） |
 
 ---
 
@@ -463,11 +541,12 @@ PAT 是长期有效的访问令牌，用于：
 │                      外部自动化服务                               │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  POST <webhook-url>                                             │
+│  POST <webhook-configured-url>                                  │
 │  Content-Type: application/json                                 │
 │                                                                  │
-│  请求体:                                                         │
+│  ⚠️ 请求体（包含 url 字段！）：                                  │
 │  {                                                               │
+│    "url": "https://example.com/webhook-endpoint",              │
 │    "activityType": "memos.memo.created",                        │
 │    "creator": "users/steven",                                   │
 │    "memo": {                                                     │
@@ -477,73 +556,87 @@ PAT 是长期有效的访问令牌，用于：
 │    }                                                             │
 │  }                                                               │
 │                                                                  │
-│  期望响应 (200 OK):                                             │
-│  {"code": 0, "message": "success"}                              │
+│  ⚠️ 外部服务必须返回（否则视为失败）：                           │
+│  HTTP/1.1 200 OK                                                 │
+│  Content-Type: application/json                                 │
+│                                                                  │
+│  {                                                               │
+│    "code": 0,                                                    │
+│    "message": "success"                                          │
+│  }                                                               │
+│                                                                  │
+│  注意：如果返回的 JSON 没有 code 字段，Go 会使用默认值 0，     │
+│       这种情况会被视为"成功"。                                  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 向内输入流
+### 3.2 向内输入与共用触发路径
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      外部自动化/AI 助手                          │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  ┌──────────────────┐           ┌──────────────────┐           │
-│  │   REST API       │           │    MCP 协议      │           │
-│  │  (Connect RPC)   │           │  (AI 助手专用)   │           │
-│  └────────┬─────────┘           └────────┬─────────┘           │
-│           │                               │                       │
-│           │ POST /api/v1/memos            │ POST /mcp            │
-│           │ PATCH /api/v1/memos/*         │ SSE 流式             │
-│           │ DELETE /api/v1/memos/*        │                      │
-│           │                               │                       │
-│           │ Authorization: Bearer <token> │ Authorization: Bearer│
-│           │                               │                       │
-│           └───────────────┬───────────────┘                       │
-│                           │                                          │
-│                           ▼                                          │
-│  ┌──────────────────────────────────────────────────────────┐     │
-│  │              认证层 (Authenticator)                       │     │
-│  │  - 支持 JWT (短期会话令牌)                                │     │
-│  │  - 支持 PAT (长期访问令牌)                                │     │
-│  │  - 从 Authorization 头提取                               │     │
-│  └───────────────────────┬──────────────────────────────────┘     │
-└──────────────────────────┼───────────────────────────────────────┘
-                           │
-                           ▼
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  方式 1: REST API (Connect RPC)                          │   │
+│  │                                                           │   │
+│  │  POST   /api/v1/memos              → CreateMemo()       │   │
+│  │  PATCH  /api/v1/memos/{name}       → UpdateMemo()       │   │
+│  │  DELETE /api/v1/memos/{name}       → DeleteMemo()       │   │
+│  │                                                           │   │
+│  │  Authorization: Bearer <token>  (JWT 或 PAT)           │   │
+│  └───────────────────────────┬──────────────────────────────┘   │
+│                              │                                     │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  方式 2: MCP 协议 (AI 助手专用)                          │   │
+│  │                                                           │   │
+│  │  POST /mcp                                                │   │
+│  │  SSE  /mcp                                                │   │
+│  │                                                           │   │
+│  │  工具调用：                                                │   │
+│  │  - create_memo    → 调用 s.apiV1Service.CreateMemo()   │   │
+│  │  - update_memo    → 调用 s.apiV1Service.UpdateMemo()   │   │
+│  │  - delete_memo    → 调用 s.apiV1Service.DeleteMemo()   │   │
+│  │  - create_memo_comment → 调用 CreateMemoComment()       │   │
+│  │                                                           │   │
+│  │  Authorization: Bearer <token>  (JWT 或 PAT)           │   │
+│  └───────────────────────────┬──────────────────────────────┘   │
+│                              │                                     │
+│                              ▼                                     │
+└──────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Memos 系统内部                            │
+│                    APIV1Service (共用业务层)                     │
+│              ⚠️  所有触发逻辑都在这里发生 ⚠️                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                   API/MCP 处理层                          │   │
-│  │                                                           │   │
-│  │  REST API:                                                │   │
-│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │   │
-│  │  │CreateMemo   │ │UpdateMemo   │ │DeleteMemo   │        │   │
-│  │  │SetAttachment│ │SetRelation  │ │CreateComment│        │   │
-│  │  └─────────────┘ └─────────────┘ └─────────────┘        │   │
-│  │                                                           │   │
-│  │  MCP 工具:                                                │   │
-│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │   │
-│  │  │create_memo  │ │update_memo  │ │delete_memo  │        │   │
-│  │  │create_comment││...          │ │...          │        │   │
-│  │  └─────────────┘ └─────────────┘ └─────────────┘        │   │
-│  │                                                           │   │
-│  │  注意: MCP 工具内部调用的是与 REST API 相同的服务方法     │   │
-│  │  (handleCreateMemo 调用 s.apiV1Service.CreateMemo)      │   │
-│  └───────────────────────┬───────────────────────────────────┘   │
-│                          │                                          │
-│                          ▼                                          │
+│  │  CreateMemo()                                             │   │
+│  │  ├── 验证权限                                             │   │
+│  │  ├── 写入数据库                                           │   │
+│  │  ├── 设置附件/关系                                        │   │
+│  │  ├── DispatchMemoCreatedWebhook()  ← 触发 webhook       │   │
+│  │  └── SSEHub.Broadcast()              ← 实时推送          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                   副作用触发层                             │   │
-│  │                                                           │   │
-│  │  1. DispatchMemo*Webhook()  → 向外发送 webhook          │   │
-│  │  2. SSEHub.Broadcast()       → 实时推送通知              │   │
-│  │  3. dispatchMentionNotifications → 提及通知              │   │
-│  └───────────────────────────────────────────────────────────┘   │
+│  │  UpdateMemo()                                             │   │
+│  │  ├── 验证权限                                             │   │
+│  │  ├── 更新数据库                                           │   │
+│  │  └── dispatchMemoUpdatedSideEffects()                    │   │
+│  │      ├── DispatchMemoUpdatedWebhook()  ← 触发 webhook   │   │
+│  │      └── SSEHub.Broadcast()          ← 实时推送          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  DeleteMemo()                                             │   │
+│  │  ├── 验证权限                                             │   │
+│  │  ├── DispatchMemoDeletedWebhook()  ← 触发 webhook       │   │
+│  │  ├── 删除数据库                                           │   │
+│  │  └── SSEHub.Broadcast()              ← 实时推送          │   │
+│  └──────────────────────────────────────────────────────────┘   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -556,7 +649,10 @@ PAT 是长期有效的访问令牌，用于：
 
 | 功能 | 文件路径 | 关键函数/行号 |
 |------|----------|---------------|
-| Webhook 核心发送 | `internal/webhook/webhook.go` | `Post()`, `PostAsync()` |
+| Webhook POST 发送 | `internal/webhook/webhook.go:84` | `Post()` |
+| 请求体序列化 | `internal/webhook/webhook.go:85` | `json.Marshal(requestPayload)` |
+| 响应判定逻辑 | `internal/webhook/webhook.go:107-121` | 状态码 + Unmarshal + code == 0 |
+| 异步投递 | `internal/webhook/webhook.go:128` | `PostAsync()` |
 | URL/IP 安全验证 | `internal/webhook/validate.go` | `ValidateURL()`, `isReservedIP()` |
 | Memo 创建触发 | `server/router/api/v1/memo_service.go:136` | `DispatchMemoCreatedWebhook()` |
 | Memo 更新触发 | `server/router/api/v1/memo_update_helpers.go:66` | `dispatchMemoUpdatedSideEffects()` |
@@ -565,24 +661,29 @@ PAT 是长期有效的访问令牌，用于：
 | 附件更新触发 | `server/router/api/v1/memo_attachment_service.go:48` | `dispatchMemoUpdatedSideEffects()` |
 | 关系更新触发 | `server/router/api/v1/memo_relation_service.go:48` | `dispatchMemoUpdatedSideEffects()` |
 
-### 4.2 向内输入处理
+### 4.2 向内输入与共用路径
 
 | 功能 | 文件路径 | 关键函数/行号 |
 |------|----------|---------------|
 | MCP 服务器核心 | `server/router/mcp/mcp.go` | `RegisterRoutes()`, `NewMCPService()` |
-| MCP Memo 工具 | `server/router/mcp/tools_memo.go` | `handleCreateMemo()`, `handleUpdateMemo()` |
-| Memo REST API | `server/router/api/v1/memo_service.go` | `CreateMemo()`, `UpdateMemo()`, `DeleteMemo()` |
-| PAT 生成与验证 | `server/auth/` | `GeneratePersonalAccessToken()`, `HashPersonalAccessToken()` |
-| PAT 管理 API | `server/router/api/v1/user_service.go:907` | `ListPersonalAccessTokens()`, `CreatePersonalAccessToken()` |
-| Webhook 配置管理 | `server/router/api/v1/user_service.go:990` | `ListUserWebhooks()`, `CreateUserWebhook()` |
+| MCP 创建 Memo | `server/router/mcp/tools_memo.go:366` | `s.apiV1Service.CreateMemo()` |
+| MCP 更新 Memo | `server/router/mcp/tools_memo.go:426` | `s.apiV1Service.UpdateMemo()` |
+| MCP 删除 Memo | `server/router/mcp/tools_memo.go:451` | `s.apiV1Service.DeleteMemo()` |
+| MCP 创建评论 | `server/router/mcp/tools_memo.go:591` | `s.apiV1Service.CreateMemoComment()` |
+| APIV1Service.CreateMemo | `server/router/api/v1/memo_service.go:41` | 共用业务入口 |
+| APIV1Service.UpdateMemo | `server/router/api/v1/memo_service.go:436` | 共用业务入口 |
+| APIV1Service.DeleteMemo | `server/router/api/v1/memo_service.go:543` | 共用业务入口 |
+| PAT 生成与验证 | `server/auth/` | `GeneratePersonalAccessToken()` |
+| Webhook 配置管理 | `server/router/api/v1/user_service.go:990` | `ListUserWebhooks()` 等 |
 
 ### 4.3 协议定义
 
 | 功能 | 文件路径 |
 |------|----------|
+| Webhook 请求体结构 | `internal/webhook/webhook.go:72` (WebhookRequestPayload) |
 | Webhook 配置数据结构 | `proto/api/v1/user_service.proto:672` (UserWebhook) |
+| Memo 数据结构 | `proto/api/v1/memo_service.proto:187` (Memo) |
 | Memo API 定义 | `proto/api/v1/memo_service.proto` |
-| PAT API 定义 | `proto/api/v1/user_service.proto:612` (PersonalAccessToken) |
 
 ---
 
@@ -590,34 +691,57 @@ PAT 是长期有效的访问令牌，用于：
 
 ### 5.1 向外事件（Webhook）
 
+#### 5.1.1 请求体相关
+
+1. **`url` 字段会被发送**：`WebhookRequestPayload.URL` 有 `json:"url"` tag，会被包含在请求体中
+2. **完整 Memo 对象**：`memo` 字段是完整的 `v1pb.Memo`，包含所有 API 可见字段
+
+#### 5.1.2 响应判定相关（重要！）
+
+1. **严格的响应格式要求**：
+   - HTTP 状态码必须 2xx
+   - 响应体必须是有效的 JSON
+   - 响应体必须能反序列化为 `{code, message}` 结构
+   - `code` 必须等于 0
+
+2. **特殊情况**：
+   - 如果 JSON 不包含 `code` 字段，`response.Code` 会是 Go `int` 的默认值 `0`，会被判定为**成功**
+   - 这是 Go JSON 反序列化的标准行为
+
+3. **常见失败场景**：
+   - 外部服务返回空响应体 → `json.Unmarshal` 失败
+   - 外部服务返回纯文本（如 `"OK"`）→ `json.Unmarshal` 失败
+   - 外部服务返回 `{"code": 1, "message": "error"}` → `code != 0` 失败
+
+#### 5.1.3 可靠性相关
+
 1. **无重试机制**：webhook 发送失败后仅记录日志，不会自动重试
 2. **队列可能溢出**：异步队列缓冲 128 个请求，高并发下可能丢弃
 3. **无批量发送**：每个 webhook 独立发送，不支持批量
 4. **无签名验证**：请求体不包含签名，外部服务无法验证请求来源的真实性
-5. **SSRF 保护**：默认禁止向私有/保留 IP 发送，本地部署需设置 `AllowPrivateIPs = true`
+
+#### 5.1.4 安全相关
+
+1. **SSRF 保护**：默认禁止向私有/保留 IP 发送
+2. **本地部署配置**：自托管场景需设置 `AllowPrivateIPs = true`
 
 ### 5.2 向内输入
 
-1. **MCP 认证**：MCP 端点支持未认证访问（仅限公共数据），修改操作需要认证
+1. **共用路径**：REST API 和 MCP 工具最终都调用 `APIV1Service` 的相同方法，触发相同的 webhook
 2. **PAT 安全**：PAT 仅在创建时显示一次，需妥善保存；建议设置过期时间
 3. **PAT 权限**：PAT 拥有用户的完整权限，无细粒度权限控制
 4. **MCP 只读模式**：建议 AI 助手使用只读端点（`/mcp/readonly`）避免意外修改
 
 ### 5.3 触发覆盖范围
 
-| 操作 | 是否触发 webhook | ActivityType |
-|------|-------------------|--------------|
-| 创建 Memo | ✅ | `memos.memo.created` |
-| 更新 Memo 内容 | ✅ | `memos.memo.updated` |
-| 更新 Memo 可见性 | ✅ | `memos.memo.updated` |
-| 更新附件 | ✅ | `memos.memo.updated` |
-| 更新关系 | ✅ | `memos.memo.updated` |
-| 置顶/取消置顶 | ✅ | `memos.memo.updated` |
-| 归档/取消归档 | ✅ | `memos.memo.updated` |
-| 删除 Memo | ✅ | `memos.memo.deleted` |
-| 创建评论 | ✅ (发送给原帖作者) | `memos.memo.comment.created` |
-| 添加/删除反应 | ❌ | - |
-| 添加/删除标签 | ❌ (标签在 payload 中解析，不单独触发) | - |
+| 操作 | 是否触发 webhook | 说明 |
+|------|-------------------|------|
+| 创建 Memo | ✅ | 通过 REST 或 MCP |
+| 更新 Memo（任何字段） | ✅ | 通过 REST 或 MCP |
+| 删除 Memo | ✅ | 通过 REST 或 MCP |
+| 创建评论 | ✅ | **发送给原帖作者**，不是评论者 |
+| 添加/删除反应 | ❌ | 无 webhook 触发 |
+| 标签变化 | ❌ | 标签是 content 的一部分，只有更新 content 时才会触发 |
 
 ---
 
@@ -625,23 +749,68 @@ PAT 是长期有效的访问令牌，用于：
 
 ### 6.1 Webhook 增强
 
-1. **添加请求签名**：使用 HMAC 签名请求体，让外部服务验证来源
-2. **实现重试机制**：使用指数退避策略重试失败的 webhook
-3. **添加 Webhook 日志**：记录 webhook 发送历史和状态
-4. **支持事件过滤**：允许用户配置仅接收特定类型的事件
-5. **支持自定义 Header**：允许用户配置自定义 HTTP 头（如 API Key）
+1. **移除冗余的 url 字段**：请求体中发送 `url` 字段是冗余的（外部服务知道自己的 URL），建议移除或至少使其可选
 
-### 6.2 输入能力增强
+2. **请求签名**：使用 HMAC 签名请求体，让外部服务验证来源：
+   ```go
+   // 建议添加的功能
+   signature := hmac_sha256(secret, body)
+   req.Header.Set("X-Memos-Signature", "sha256=" + signature)
+   ```
 
-1. **Webhook 接收端点**：提供专门的 inbound webhook 端点，允许外部服务通过 webhook 推送数据
-2. **PAT 细粒度权限**：为 PAT 添加权限范围（如只读、仅创建等）
-3. **API 速率限制**：为 API 添加速率限制防止滥用
-4. **MCP 工具增强**：添加更多 MCP 工具，如批量操作、导入导出等
+3. **响应判定宽松化**：
+   - 允许空响应体（2xx 状态码即视为成功）
+   - 允许纯文本响应
+   - 或者至少提供配置选项让用户选择严格/宽松模式
 
-### 6.3 同步模式建议
+4. **重试机制**：使用指数退避策略重试失败的 webhook
 
-对于需要双向同步的场景（如与其他笔记工具同步），建议：
+5. **Webhook 日志**：记录 webhook 发送历史和状态，方便调试
 
-1. **向外**：使用 webhook 监听变化，结合 `activityType` 和 `memo.update_time` 去重
-2. **向内**：使用 MCP 协议或 REST API + PAT 进行写入
-3. **同步状态**：在 memo 内容或 payload 中添加同步标记（如 `[synced:tool-name]`）避免循环同步
+6. **事件过滤**：允许用户配置仅接收特定类型的事件
+
+7. **自定义 Header**：允许用户配置自定义 HTTP 头（如 API Key）
+
+### 6.2 外部服务实现指南
+
+如果要实现一个接收 Memos webhook 的外部服务，必须返回：
+
+```go
+// 推荐的处理方式
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. 读取请求体
+    body, _ := io.ReadAll(r.Body)
+    
+    // 2. 处理业务逻辑
+    // ...
+    
+    // 3. ⚠️ 必须返回这样的响应！
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "code":    0,
+        "message": "success",
+    })
+}
+```
+
+### 6.3 同步场景建议
+
+对于需要双向同步的场景（如与其他笔记工具同步）：
+
+1. **向外同步**：
+   - 使用 webhook 监听变化
+   - 结合 `activityType` 和 `memo.update_time` 去重
+   - 注意 `code` 必须返回 0，否则 webhook 会被视为失败（但不会重试）
+
+2. **向内同步**：
+   - 使用 REST API + PAT
+   - 或使用 MCP 协议（如果是 AI 驱动的同步）
+
+3. **循环同步防护**：
+   - 在 memo 内容或 payload 中添加同步标记（如 `[synced:tool-name]`）
+   - 外部服务接收 webhook 时检查标记，避免循环同步
+
+4. **可靠性考虑**：
+   - webhook 无重试机制，建议外部服务实现自己的可靠性保证
+   - 或考虑轮询 API 作为补充（检查 `update_time`）
