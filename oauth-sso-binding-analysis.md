@@ -720,7 +720,7 @@ return (
 
 ### 3. 后端开关逻辑
 
-#### 3.1 密码登录检查
+#### 3.1 密码登录检查 (管理员例外机制)
 
 **文件位置**: `server/router/api/v1/auth_service.go:82-89`
 
@@ -728,8 +728,8 @@ return (
 // 密码登录时检查
 instanceGeneralSetting, err := s.Store.GetInstanceGeneralSetting(ctx)
 if instanceGeneralSetting.DisallowPasswordAuth && user.Role == store.RoleUser {
-    // 普通用户被禁止使用密码登录
-    // 管理员不受此限制
+    // 仅普通用户被禁止使用密码登录
+    // 管理员 (RoleAdmin) 不受此限制，可以继续使用密码登录
     return nil, status.Errorf(
         codes.PermissionDenied, 
         "password signin is not allowed"
@@ -737,7 +737,28 @@ if instanceGeneralSetting.DisallowPasswordAuth && user.Role == store.RoleUser {
 }
 ```
 
-**注意**: `DisallowPasswordAuth` 仅限制普通用户，管理员仍可使用密码登录。
+**用户角色定义** (`store/user.go:11-16`):
+```go
+const (
+    // RoleAdmin is the ADMIN role.
+    RoleAdmin Role = "ADMIN"
+    // RoleUser is the USER role.
+    RoleUser Role = "USER"
+)
+```
+
+**关键设计说明**:
+- `DisallowPasswordAuth` 采用**条件限制**而非完全禁用
+- 限制条件：`DisallowPasswordAuth && user.Role == RoleUser`
+- 这意味着：
+  - **普通用户 (USER)**: 当 `DisallowPasswordAuth=true` 时，无法使用密码登录
+  - **管理员 (ADMIN)**: 无论 `DisallowPasswordAuth` 如何设置，始终可以使用密码登录
+- **设计目的**: 防止管理员被锁定在系统外。即使配置了强制 SSO，管理员仍可通过密码登录进行紧急维护和配置调整。
+
+**前端行为补充**:
+- 当 `DisallowPasswordAuth=true` 时，前端登录页面会隐藏密码登录表单
+- 但这只是 UI 层面的隐藏，后端仍保留管理员密码登录能力
+- 管理员可以直接调用 API 或通过其他方式使用密码登录
 
 #### 3.2 SSO 首次登录检查
 
