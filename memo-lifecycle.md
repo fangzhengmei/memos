@@ -187,7 +187,7 @@ if request.State == v1pb.State_ARCHIVED {
 
 **GetMemo 权限检查** - `memo_service.go:338-347`:
 ```go
-// 归档的 memo 只对创建者可见
+// Archived memos are only visible to their creator.
 if memo.RowStatus == store.Archived {
     user, err := s.fetchCurrentUser(ctx)
     if err != nil {
@@ -200,10 +200,11 @@ if memo.RowStatus == store.Archived {
 ```
 
 **关键点**:
-- 归档的 memo 对其他用户表现为"不存在"（返回 NotFound）
+- **ARCHIVED 状态优先级最高**：会覆盖可见性检查
+- **信息隐藏**：非创建者访问归档 memo 时返回 `NotFound`（假装不存在），而不是 `PermissionDenied`
 - 只有创建者可以查看和操作归档的 memo
 - ListMemos 默认只返回 `NORMAL` 状态的 memo
-- 要查看归档 memo，需显式指定 `state=ARCHIVED`
+- 要查看归档 memo，需显式指定 `state=ARCHIVED`，且只能看到自己的
 - **归档的 memo 无法通过分享链接访问**
 
 ### 3.4 删除 (DeleteMemo)
@@ -234,13 +235,25 @@ Memo 有两种独立的访问路径：**常规 API 访问** 和 **分享链接�
 
 ### 4.1 常规 API 访问控制
 
-常规 API 包括 `GetMemo`、`ListMemos`、`ListMemoComments` 等，这些 API 在 ACL 中被标记为公开，但在服务层有可见性过滤。
+常规 API 包括 `GetMemo`、`ListMemos`、`ListMemoComments` 等，这些 API 在 ACL 中被标记为公开，但在服务层有严格的权限检查。
 
-#### 4.1.1 可见性过滤逻辑
+#### 4.1.1 权限检查顺序
 
-**核心逻辑** - `memo_service.go:349-360`:
+**GetMemo 的检查逻辑** - `memo_service.go:338-360`:
 
 ```go
+// 第一步：检查归档状态（优先级最高）
+if memo.RowStatus == store.Archived {
+    user, err := s.fetchCurrentUser(ctx)
+    if err != nil {
+        return nil, status.Errorf(codes.Internal, "failed to get user")
+    }
+    if user == nil || memo.CreatorID != user.ID {
+        return nil, status.Errorf(codes.NotFound, "memo not found")  // 信息隐藏
+    }
+}
+
+// 第二步：检查可见性（仅对非 PUBLIC 可见性）
 if memo.Visibility != store.Public {
     user, err := s.fetchCurrentUser(ctx)
     if err != nil {
@@ -255,15 +268,37 @@ if memo.Visibility != store.Public {
 }
 ```
 
-#### 4.1.2 访问权限矩阵
+**关键规则**：
 
-| Memo 可见性 | 未登录用户 | 已登录非创建者 | 创建者/管理员 |
-|---|---|---|---|
-| PUBLIC | ✅ 可见 | ✅ 可见 | ✅ 可见 |
-| PROTECTED | ❌ 401 Unauthenticated | ✅ 可见 | ✅ 可见 |
-| PRIVATE | ❌ 401 Unauthenticated | ❌ 403 PermissionDenied | ✅ 可见 |
+1. **ARCHIVED 状态优先**：
+   - 如果是 ARCHIVED，非创建者统一返回 `NotFound`（假装不存在）
+   - 这会**覆盖**后续的可见性检查
 
-#### 4.1.3 ListMemos 过滤逻辑
+2. **可见性检查（仅当状态为 NORMAL 时）**：
+   - `PUBLIC`：所有人可见（包括未登录）
+   - `PROTECTED`：未登录返回 `Unauthenticated`，已登录则允许
+   - `PRIVATE`：未登录返回 `Unauthenticated`，已登录非创建者返回 `PermissionDenied`
+
+#### 4.1.2 完整权限矩阵
+
+| 状态 | 可见性 | 未登录用户 | 已登录非创建者 | 创建者/管理员 |
+|---|---|---|---|---|
+| NORMAL | PUBLIC | ✅ 可见 | ✅ 可见 | ✅ 可见 |
+| NORMAL | PROTECTED | ❌ 401 Unauthenticated | ✅ 可见 | ✅ 可见 |
+| NORMAL | PRIVATE | ❌ 401 Unauthenticated | ❌ 403 PermissionDenied | ✅ 可见 |
+| ARCHIVED | PUBLIC | ❌ 404 NotFound | ❌ 404 NotFound | ✅ 可见 |
+| ARCHIVED | PROTECTED | ❌ 404 NotFound | ❌ 404 NotFound | ✅ 可见 |
+| ARCHIVED | PRIVATE | ❌ 404 NotFound | ❌ 404 NotFound | ✅ 可见 |
+
+#### 4.1.3 错误码含义
+
+| 错误码 | 触发场景 |
+|---|---|
+| 401 Unauthenticated | 未登录用户访问非 PUBLIC 的 NORMAL memo |
+| 403 PermissionDenied | 已登录非创建者访问 PRIVATE 的 NORMAL memo |
+| 404 NotFound | 任何非创建者访问 ARCHIVED memo（信息隐藏） |
+
+#### 4.1.4 ListMemos 过滤逻辑
 
 **位置**: `server/router/api/v1/memo_service.go:197-206`
 
@@ -283,7 +318,14 @@ if currentUser == nil {
 }
 ```
 
-#### 4.1.4 评论权限检查
+**ListMemos 行为总结**：
+
+| 查询条件 | 未登录用户 | 已登录用户 |
+|---|---|---|
+| 无特殊参数 | 仅看到 NORMAL + PUBLIC | 看到 NORMAL +（自己的所有 + 他人的 PUBLIC/PROTECTED） |
+| `?state=ARCHIVED` | 返回空列表 | 仅看到自己的 ARCHIVED memo（忽略可见性） |
+
+#### 4.1.5 评论权限检查
 
 **位置**: `server/router/api/v1/memo_service.go:641-643`
 
@@ -293,7 +335,7 @@ if relatedMemo.Visibility == store.Private && relatedMemo.CreatorID != user.ID &
 }
 ```
 
-**规则**:
+**规则**：
 - `PRIVATE` memo: 只有创建者和管理员可以评论
 - `PROTECTED`/`PUBLIC`: 任何已登录用户可以评论
 
@@ -337,9 +379,9 @@ func (s *APIV1Service) GetMemoByShare(ctx context.Context, request *v1pb.GetMemo
 }
 ```
 
-**关键特性**:
+**关键特性**：
 - **无需认证**: 任何人持有有效 token 即可访问
-- **绕过可见性**: 不检查 memo 的 `visibility` 字段
+- **绕过可见性**: 不检查 memo 的 `visibility` 字段（PRIVATE 也能访问）
 - **唯一限制**: 
   - Token 必须有效且未过期
   - Memo 不能是 `ARCHIVED` 状态
@@ -352,6 +394,8 @@ func (s *APIV1Service) GetMemoByShare(ctx context.Context, request *v1pb.GetMemo
 | NORMAL + PROTECTED | ✅ 可见 |
 | NORMAL + PRIVATE | ✅ 可见 |
 | ARCHIVED + 任意 | ❌ 404 NotFound |
+
+**重要**：分享链接可以访问 `PRIVATE` 的 memo！这是分享链接的设计目的——让你可以将私有内容分享给特定的人。
 
 #### 4.2.4 附件的分享链接访问
 
@@ -369,7 +413,7 @@ if shareToken := (*c).QueryParam("share_token"); shareToken != "" {
 }
 ```
 
-**规则**:
+**规则**：
 - 附件可以通过 `?share_token=` URL 参数绕过可见性检查
 - 这允许分享链接页面正确显示私有/受保护 memo 的附件
 
@@ -393,8 +437,9 @@ if shareToken := (*c).QueryParam("share_token"); shareToken != "" {
 |---|---|---|
 | 认证要求 | 部分需要（依可见性而定） | 无需认证 |
 | 可见性检查 | 严格执行 | **不检查** |
-| 访问范围 | 依可见性和身份而定 | 持有有效 token 即可 |
+| 访问范围 | 依状态、可见性和身份而定 | 持有有效 token 即可 |
 | 归档限制 | 仅创建者可见 | **完全无法访问** |
+| 能否访问 PRIVATE | 仅创建者/管理员 | ✅ 持有 token 即可 |
 | 典型用途 | 日常使用、浏览 | 分享给外部用户 |
 
 ## 五、默认可见性配置
@@ -446,7 +491,7 @@ useMemoInit({
 | NORMAL | PUBLIC | 所有人（未登录 + 已登录） |
 | NORMAL | PROTECTED | 已登录用户（任意） |
 | NORMAL | PRIVATE | 仅创建者/管理员 |
-| ARCHIVED | 任意 | 仅创建者/管理员 |
+| ARCHIVED | 任意 | 仅创建者/管理员（非创建者返回 404） |
 
 ### 6.2 分享链接访问路径
 
@@ -468,8 +513,9 @@ useMemoInit({
 | CreateMemo | `server/router/api/v1/memo_service.go` | 41-155 |
 | UpdateMemo | `server/router/api/v1/memo_service.go` | 436-541 |
 | DeleteMemo | `server/router/api/v1/memo_service.go` | 543-618 |
-| ListMemos 可见性过滤 | `server/router/api/v1/memo_service.go` | 197-206 |
 | GetMemo 权限检查 | `server/router/api/v1/memo_service.go` | 338-360 |
+| ListMemos 可见性过滤 | `server/router/api/v1/memo_service.go` | 197-206 |
+| ListMemos 归档过滤 | `server/router/api/v1/memo_service.go` | 167-178 |
 | GetMemoByShare | `server/router/api/v1/memo_share_service.go` | 151-192 |
 | 分享链接 ACL 配置 | `server/router/api/v1/acl_config.go` | 38-39 |
 | 附件分享 token 检查 | `server/router/fileserver/fileserver.go` | 665-673 |
