@@ -258,10 +258,35 @@ ALTER TABLE resource DROP COLUMN external_link;
 
 #### 前端处理逻辑
 
-`web/src/hooks/useAttachmentLibrary.ts:84`：
+**核心 URL 选择函数**（`web/src/utils/attachment.ts:3-17`）：
 
 ```typescript
-sourceUrl: attachment.externalLink || `${window.location.origin}/file/${attachment.name}/${attachment.filename}`,
+// 主预览 URL
+export const getAttachmentUrl = (attachment: Attachment) => {
+  if (attachment.externalLink) {
+    return attachment.externalLink;  // 有 externalLink 直接使用
+  }
+  return `${window.location.origin}/file/${attachment.name}/${attachment.filename}`;
+};
+
+// 缩略图 URL - 总是使用文件服务路由
+export const getAttachmentThumbnailUrl = (attachment: Attachment) => {
+  return `${window.location.origin}/file/${attachment.name}/${attachment.filename}?thumbnail=true`;
+};
+
+// 动态视频 URL - 总是使用文件服务路由
+export const getAttachmentMotionClipUrl = (attachment: Attachment) => {
+  return `${window.location.origin}/file/${attachment.name}/${attachment.filename}?motion=true`;
+};
+```
+
+**图片预览场景的实际使用**（`web/src/utils/media-item.ts:116-117`）：
+
+```typescript
+const sourceUrl = getAttachmentUrl(attachment);  // 主预览：有 externalLink 就用
+const posterUrl = attachmentType === "image/*" 
+  ? getAttachmentThumbnailUrl(attachment)  // 缩略图：总是用文件服务路由
+  : sourceUrl;
 ```
 
 这是关键的分流逻辑：
