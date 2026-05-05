@@ -732,4 +732,693 @@ func (s *APIV1Service) RegisterGateway(ctx context.Context, echoServer *echo.Ech
 3. **双协议支持**：gRPC-Gateway 提供 RESTful HTTP，Connect 提供浏览器友好的 RPC
 4. **生成代码驱动**：所有接口和注册函数都由 `buf generate` 生成
 
-## 6. CI/CD 边界
+## 6. CI/CD 边界与职责划分
+
+### 6.1 关键边界声明
+
+**重要区分**：
+
+| 职责 | 本地开发者 | CI 流水线 |
+|------|-----------|-----------|
+| 修改 proto 文件 | ✅ | ❌ |
+| 运行 `buf generate` | ✅ **必需** | ❌ **不会执行** |
+| 提交生成的代码 | ✅ **必需** | ❌ |
+| 检查 proto 语法（buf lint） | 建议执行 | ✅ 强制执行 |
+| 检查 proto 格式（buf format） | 建议执行 | ✅ 强制执行 |
+| 检查 Go 代码编译 | 建议执行 | ✅ 强制执行 |
+| 检查 TypeScript 类型 | 建议执行 | ✅ 强制执行 |
+| **验证生成代码与 proto 同步** | 人工检查 | ❌ **无检查** |
+
+### 6.1.1 本地手动生成 vs CI 校验：能发现什么，漏掉什么
+
+这是整个同步机制中最关键的边界。以下是清晰的能力对比：
+
+#### 本地手动生成（开发者执行 `buf generate`）
+
+| 检查项 | 能发现 | 漏掉 |
+|--------|--------|------|
+| **Proto 语法错误** | ❌ 不检查（需单独运行 `buf lint`） | - |
+| **Proto 格式问题** | ❌ 不检查（需单独运行 `buf format`） | - |
+| **生成代码与 proto 同步** | ✅ 确保同步（直接覆盖生成） | - |
+| **Go 类型编译** | ✅ 生成合法的 Go 代码 | ❌ 不检查业务逻辑是否正确使用新类型 |
+| **TypeScript 类型编译** | ✅ 生成合法的 TS 代码 | ❌ 不检查前端代码是否正确使用新类型 |
+
+**本地生成的核心作用**：将 proto 定义转换为可编译的代码。但它**不验证**：
+- 业务逻辑是否正确使用新字段
+- 破坏性变更的影响范围
+- 前后端使用一致性
+
+#### CI 校验（现有实现）
+
+| 检查项 | 能发现 | 漏掉 |
+|--------|--------|------|
+| **Proto 语法错误** | ✅ `buf lint` | - |
+| **Proto 格式问题** | ✅ `buf format` 检查 | - |
+| **Go 代码编译** | ✅ `go build` | ❌ 不检查生成代码是否与 proto 同步 |
+| **TypeScript 类型** | ✅ `tsc --noEmit` | ❌ 不检查生成代码是否与 proto 同步 |
+| **生成代码与 proto 同步** | ❌ **完全漏掉** | - |
+| **破坏性变更** | ❌ **完全漏掉** | - |
+
+**最危险的遗漏**：CI 无法发现以下场景：
+
+```
+场景：开发者修改 proto 添加新字段 Location，
+      但忘记运行 buf generate，直接提交 PR。
+
+CI 检查结果：
+├── ✅ buf lint 通过（proto 语法正确）
+├── ✅ buf format 通过（proto 格式正确）
+├── ✅ go build 通过（使用仓库中旧的生成代码编译）
+├── ✅ pnpm lint 通过（使用仓库中旧的生成代码编译）
+└── ❌ 完全没发现：proto 与生成代码不同步！
+
+后果：
+- 后端运行时：proto 定义有 Location，但生成代码没有
+- 前端运行时：完全不知道有 Location 字段
+- 运行时行为不一致，但 CI 全部通过
+```
+
+#### 对比总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  本地生成（buf generate）能保证什么？                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ✅ 保证 proto 到生成代码的转换是完整的                                       │
+│  ✅ 保证生成的代码语法正确（可编译）                                           │
+│  ❌ 不保证 proto 本身语法正确（需 buf lint）                                  │
+│  ❌ 不保证业务逻辑正确使用新类型                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CI 校验（现有）能保证什么？                                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ✅ 保证 proto 语法正确                                                       │
+│  ✅ 保证 proto 格式规范                                                       │
+│  ✅ 保证代码能编译通过                                                         │
+│  ❌ **完全不能保证** proto 与生成代码的同步性！                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 CI 工作流分析
+
+#### 6.2.1 proto-linter.yml - 仅检查 proto 源文件
+
+```yaml
+name: Proto Linter
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "proto/**"
+
+jobs:
+  lint:
+    steps:
+      # 1. 运行 buf lint - 检查 proto 语法和风格
+      - name: Run buf lint
+        uses: bufbuild/buf-lint-action@v1
+        with:
+          input: proto
+
+      # 2. 检查 buf format - 检查 proto 文件格式
+      - name: Check buf format
+        run: |
+          if [[ $(buf format -d) ]]; then
+            echo "❌ Proto files are not formatted."
+            exit 1
+          fi
+```
+
+**这个 CI 检查的范围**：
+- ✅ 检查 `.proto` 文件的语法正确性
+- ✅ 检查 `.proto` 文件的格式规范性
+- ❌ **不检查** 生成的代码（`proto/gen/`, `web/src/types/proto/`）
+- ❌ **不运行** `buf generate`
+- ❌ **不验证** 生成代码与 proto 的一致性
+
+#### 6.2.2 backend-tests.yml - 检查 Go 代码
+
+```yaml
+name: Backend Tests
+
+on:
+  paths:
+    - "go.mod"
+    - "go.sum"
+    - "**.go"  # 包括生成的 .pb.go 文件
+
+jobs:
+  static-checks:
+    steps:
+      - name: Run golangci-lint
+        uses: golangci-lint-action@v9
+
+  tests:
+    steps:
+      - name: Run tests
+        run: go test ./...
+```
+
+**这个 CI 检查的范围**：
+- ✅ 检查 Go 代码能否编译通过
+- ✅ 运行 Go 测试
+- ❌ **不检查** 生成的 Go 代码是否与 proto 同步
+- ❌ 即使 proto 修改了但生成代码没更新，只要 Go 代码能编译就通过
+
+#### 6.2.3 frontend-tests.yml - 检查 TypeScript 代码
+
+```yaml
+name: Frontend Tests
+
+on:
+  paths:
+    - "web/**"  # 包括生成的 *_pb.ts 文件
+
+jobs:
+  lint:
+    steps:
+      - name: Run lint
+        working-directory: web
+        run: pnpm lint  # tsc --noEmit + biome check
+```
+
+**这个 CI 检查的范围**：
+- ✅ 检查 TypeScript 类型能否通过编译
+- ❌ **不检查** 生成的 TypeScript 代码是否与 proto 同步
+- ❌ 即使 proto 修改了但生成代码没更新，只要 TS 代码能编译就通过
+
+### 6.3 实际同步流程（开发者端）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         开发者端同步流程                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  1. 修改 Protobuf Schema                                                       │
+│     文件: proto/api/v1/memo_service.proto                                     │
+│     示例: 添加新字段 `optional Location location = 18;`                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  2. ⚠️ 本地手动运行代码生成 ⚠️                                                  │
+│     命令: cd proto && buf generate                                             │
+│                                                                                 │
+│     这是唯一的同步点！                                                          │
+│     如果忘记这一步，生成代码与 proto 就会失配                                   │
+│                                                                                 │
+│     生成内容:                                                                    │
+│     ├── proto/gen/api/v1/memo_service.pb.go          (更新)                   │
+│     ├── proto/gen/api/v1/apiv1connect/memo_service.connect.go (更新)          │
+│     └── web/src/types/proto/api/v1/memo_service_pb.ts (更新)                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  3. 本地检查（可选但推荐）                                                      │
+│     ├── buf lint          # 检查 proto 语法                                    │
+│     ├── buf format -w     # 格式化 proto 文件                                  │
+│     ├── go build ./...   # 检查 Go 编译                                       │
+│     └── cd web && pnpm lint  # 检查 TypeScript 类型                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  4. 提交所有相关文件                                                            │
+│     需要同时提交：                                                              │
+│     ├── ✅ 修改的 proto/api/v1/*.proto                                        │
+│     ├── ✅ 重新生成的 proto/gen/**                                             │
+│     └── ✅ 重新生成的 web/src/types/proto/**                                   │
+│                                                                                 │
+│     ⚠️ 危险：如果只提交 .proto 但不提交生成代码，就会产生同步失配！             │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  5. PR CI 检查                                                                 │
+│     CI 会执行：                                                                 │
+│     ├── buf lint          # ✅ 通过（proto 没问题）                           │
+│     ├── buf format        # ✅ 通过（proto 格式化了）                         │
+│     ├── go build          # ✅ 通过（如果生成代码也提交了）                    │
+│     └── pnpm lint         # ✅ 通过（如果生成代码也提交了）                    │
+│                                                                                 │
+│     ⚠️ 注意：CI 不会检查生成代码是否与 proto 匹配！                             │
+│        如果开发者提交了新 proto 但忘记提交生成代码，                           │
+│        CI 仍然可能通过（使用旧的生成代码）                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 7. 同步失配风险分析
+
+### 7.1 什么是同步失配？
+
+**同步失配** 指：**Protobuf Schema 定义** 与 **生成的代码** 之间不一致。
+
+由于 CI **不会**验证这种一致性，完全依赖开发者手动执行 `buf generate` 并提交所有生成文件，失配风险是真实存在的。
+
+### 7.2 典型失配场景
+
+#### 场景 1：修改 proto 但忘记运行 buf generate
+
+```
+开发者操作:
+1. 修改 proto/api/v1/memo_service.proto，添加新字段 Location
+2. 直接提交 .proto 文件
+3. 忘记运行 buf generate
+4. 忘记提交生成的代码
+
+结果:
+- ✅ CI: buf lint 通过（proto 语法正确）
+- ✅ CI: go build 通过（使用旧的生成代码编译）
+- ✅ CI: pnpm lint 通过（使用旧的生成代码编译）
+- ❌ 运行时: 新字段不会生效，前后端都不知道有这个字段
+```
+
+#### 场景 2：运行了 buf generate 但只提交部分文件
+
+```
+开发者操作:
+1. 修改 proto/api/v1/memo_service.proto
+2. 运行 buf generate
+3. 只提交 .proto 和 Go 生成代码
+4. 忘记提交前端的 web/src/types/proto/*.ts
+
+结果:
+- ✅ 后端: 使用新字段
+- ❌ 前端: 仍使用旧类型，不知道新字段存在
+- ❌ 运行时: 可能出现序列化/反序列化问题
+```
+
+#### 场景 3：多人协作时的生成代码冲突
+
+```
+场景:
+1. 开发者 A 修改 proto 并生成代码，提交 PR
+2. 开发者 B 同时修改另一个 proto 并生成代码，提交 PR
+3. 其中一个 PR 合并后，另一个 PR 的生成代码可能冲突
+
+风险:
+- 生成代码是机器生成的，手动解决冲突容易出错
+- 可能引入细微的类型错误
+```
+
+#### 场景 4：proto 破坏性变更但生成代码未同步
+
+```
+开发者操作:
+1. 在 proto 中重命名字段（破坏性行为）
+2. 忘记运行 buf generate
+3. 提交代码
+
+结果:
+- ✅ CI: 通过（使用旧生成代码）
+- ❌ 运行时: 字段不匹配，可能导致数据丢失或错误
+```
+
+### 7.3 失配的影响层级
+
+| 失配类型 | 编译时（Go/TS） | 运行时 | 影响程度 |
+|----------|-----------------|--------|----------|
+| 新增字段 | ✅ 无感知（使用旧生成代码） | 后端收到但前端不知道 | 中等 |
+| 删除字段 | ✅ 无感知 | 可能 panic 或数据错误 | 高 |
+| 修改字段类型 | ✅ 无感知 | 序列化/反序列化失败 | 高 |
+| 修改方法签名 | ✅ 无感知 | RPC 调用失败 | 高 |
+| 重命名消息 | ❌ 编译失败（如果业务代码引用） | - | 低（早发现） |
+
+**最危险的情况**：新增/删除字段但业务代码不直接引用消息类型。这种情况下 CI 完全通过，但运行时行为不一致。
+
+## 8. 防错建议与最佳实践
+
+### 8.1 本地开发流程强化
+
+#### 建议 1：使用 Makefile 或脚本封装常用操作
+
+```makefile
+# 建议添加到项目根目录的 Makefile
+
+.PHONY: proto
+proto:  # 一键生成 + 格式化
+	cd proto && buf generate && buf format -w
+
+.PHONY: proto-check
+proto-check:  # 检查 proto 是否需要生成或格式化
+	cd proto && buf lint && buf format -d
+
+.PHONY: generate
+generate: proto  # 生成后检查类型
+	go build ./...
+	cd web && pnpm lint
+```
+
+**使用方式**：
+```bash
+# 修改 proto 后，运行：
+make generate
+
+# 这会：
+# 1. buf generate（生成代码）
+# 2. buf format -w（格式化 proto）
+# 3. go build（检查 Go 编译）
+# 4. pnpm lint（检查 TypeScript）
+```
+
+#### 建议 2：配置 Git Pre-Commit Hook
+
+创建 `.git/hooks/pre-commit`（或使用 [pre-commit](https://pre-commit.com/) 框架）：
+
+```bash
+#!/bin/bash
+
+# 检查 proto 文件是否有变更但生成代码未更新
+proto_files=$(git diff --cached --name-only -- 'proto/api/v1/*.proto')
+if [ -n "$proto_files" ]; then
+    echo "⚠️  检测到 proto 文件变更，检查生成代码..."
+    
+    # 检查生成的 Go 代码是否也在暂存区
+    gen_go_files=$(git diff --cached --name-only -- 'proto/gen/**')
+    gen_ts_files=$(git diff --cached --name-only -- 'web/src/types/proto/**')
+    
+    if [ -z "$gen_go_files" ] && [ -z "$gen_ts_files" ]; then
+        echo "❌ 错误：proto 文件已修改，但生成代码未提交！"
+        echo "   请运行: cd proto && buf generate"
+        echo "   然后提交: proto/gen/ 和 web/src/types/proto/"
+        exit 1
+    fi
+fi
+
+# 检查 buf lint
+if command -v buf &> /dev/null; then
+    if ! cd proto && buf lint; then
+        echo "❌ proto lint 检查失败"
+        exit 1
+    fi
+fi
+
+exit 0
+```
+
+### 8.2 CI 流程增强建议
+
+当前 CI **不会**检查生成代码与 proto 的同步性。可以考虑增强：
+
+#### 建议 1：添加生成代码同步性检查
+
+```yaml
+# 建议新增或修改 .github/workflows/proto-linter.yml
+
+jobs:
+  lint:
+    name: Lint Protos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup buf
+        uses: bufbuild/buf-setup-action@v1
+
+      # 原有检查
+      - name: Run buf lint
+        uses: bufbuild/buf-lint-action@v1
+        with:
+          input: proto
+
+      - name: Check buf format
+        run: |
+          if [[ $(buf format -d) ]]; then
+            echo "❌ Proto files are not formatted."
+            exit 1
+          fi
+
+      # ⬇️ 新增：检查生成代码是否同步 ⬇️
+      - name: Check if generated code is in sync
+        run: |
+          # 1. 保存当前生成代码的状态
+          tar -cf /tmp/gen-before.tar proto/gen web/src/types/proto
+
+          # 2. 重新生成代码
+          cd proto && buf generate
+
+          # 3. 比较差异
+          if ! git diff --quiet proto/gen web/src/types/proto; then
+            echo "❌ 生成代码与 proto 不同步！"
+            echo "   请在本地运行: cd proto && buf generate"
+            echo "   然后提交重新生成的代码"
+            echo ""
+            echo "   差异详情："
+            git diff proto/gen web/src/types/proto
+            exit 1
+          fi
+
+          echo "✅ 生成代码与 proto 同步"
+```
+
+**这个检查的效果**：
+- 如果开发者只修改了 proto 但忘记运行 `buf generate`，CI 会失败
+- 如果开发者运行了 `buf generate` 但忘记提交生成文件，CI 会失败
+- 确保 proto 与生成代码永远同步
+
+#### 建议 2：为 proto 相关文件设置 CODEOWNERS
+
+在 `.github/CODEOWNERS` 中添加：
+```
+# 确保 proto 相关变更需要特定人员审查
+proto/api/v1/*.proto    @api-owners
+proto/gen/              @api-owners
+web/src/types/proto/    @api-owners
+```
+
+### 8.3 代码审查 Checklist
+
+在 PR 审查时，检查以下项目：
+
+```
+📋 API 变更审查清单
+
+当 PR 包含 proto 文件变更时：
+
+1. [ ] proto 文件语法是否正确？
+   - 可通过本地 buf lint 验证
+
+2. [ ] 生成的代码是否同时更新？
+   - 检查 proto/gen/ 目录
+   - 检查 web/src/types/proto/ 目录
+
+3. [ ] 字段编号是否正确使用？
+   - 新增字段使用新的字段号
+   - 删除字段使用 reserved 标记
+
+4. [ ] 是否有破坏性变更？
+   - 重命名字段？
+   - 修改字段类型？
+   - 删除必需字段？
+
+5. [ ] 后端实现是否更新？
+   - 服务实现是否处理新字段？
+   - 数据库迁移是否同步？
+
+6. [ ] 前端使用是否更新？
+   - Hooks 是否使用新字段？
+   - UI 是否展示新字段？
+```
+
+### 8.4 破坏性变更管理
+
+#### 必须使用 reserved 关键字
+
+当删除字段或消息时，必须使用 `reserved` 标记：
+
+```protobuf
+message Memo {
+  string name = 1;
+  string content = 7;
+  
+  // ❌ 错误：直接删除字段，编号可能被重用
+  // reserved 6;  // 原来的 display_time 字段已删除
+  
+  // ✅ 正确：使用 reserved 标记已删除的字段编号和名称
+  reserved 6;
+  reserved "display_time";
+}
+```
+
+#### 破坏性变更检查
+
+使用 `buf breaking` 检查破坏性变更：
+
+```bash
+# 检查相对于 main 分支的破坏性变更
+cd proto && buf breaking --against '.git#branch=main'
+```
+
+可以在 CI 或 pre-commit hook 中添加此检查。
+
+### 8.5 最佳实践总结
+
+| 实践 | 目的 | 实施方式 |
+|------|------|----------|
+| **封装生成命令** | 减少手动操作错误 | Makefile / npm scripts |
+| **Pre-commit Hook** | 提交前强制检查 | Git hooks / pre-commit 框架 |
+| **CI 同步检查** | 确保代码库一致性 | 新增 CI 步骤（建议） |
+| **CODEOWNERS** | 确保专业人员审查 | 配置 proto 目录所有者 |
+| **审查 Checklist** | 人工检查关键点 | PR 模板 |
+| **reserved 关键字** | 防止字段编号冲突 | proto 文件规范 |
+| **buf breaking** | 检测破坏性变更 | CI / pre-commit |
+
+## 9. 同步机制流程图（修正版）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         完整同步流程图                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 1: 本地开发（开发者负责）                                                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐                                                            │
+│  │ 修改 .proto  │                                                            │
+│  └──────┬───────┘                                                            │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ ⚠️  关键点：必须手动运行 buf generate                                    │  │
+│  │                                                                    │  │
+│  │  开发者执行: cd proto && buf generate                               │  │
+│  │                                                                    │  │
+│  │  输出:                                                              │  │
+│  │  ├── proto/gen/api/v1/*.pb.go          (Go 类型)                  │  │
+│  │  ├── proto/gen/api/v1/apiv1connect/   (Connect 注册)              │  │
+│  │  └── web/src/types/proto/api/v1/*_pb.ts (TS 类型)                 │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 本地检查（推荐）                                                        │  │
+│  │ ├── buf lint              # 检查 proto 语法                           │  │
+│  │ ├── buf format -w         # 格式化 proto                               │  │
+│  │ ├── go build ./...        # 检查 Go 编译                              │  │
+│  │ ├── buf breaking --against # 检查破坏性变更                            │  │
+│  │ └── cd web && pnpm lint   # 检查 TypeScript                            │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ ⚠️  关键点：必须同时提交所有相关文件                                      │  │
+│  │                                                                    │  │
+│  │ git add:                                                            │  │
+│  │ ├── ✅ proto/api/v1/*.proto          (源文件)                       │  │
+│  │ ├── ✅ proto/gen/**                   (生成的 Go 代码)               │  │
+│  │ └── ✅ web/src/types/proto/**          (生成的 TS 代码)               │  │
+│  │                                                                    │  │
+│  │ ⚠️  危险：只提交 .proto 但不提交生成代码 = 同步失配！                  │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 2: CI 检查（当前实现）                                                   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  当前 CI 检查范围：                                                            │
+│                                                                              │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐        │
+│  │ proto-linter.yml│    │ backend-tests   │    │ frontend-tests  │        │
+│  ├─────────────────┤    ├─────────────────┤    ├─────────────────┤        │
+│  │ ✅ buf lint     │    │ ✅ go build     │    │ ✅ tsc --noEmit │        │
+│  │ ✅ buf format   │    │ ✅ go test      │    │ ✅ biome check   │        │
+│  │                 │    │ ✅ golangci-lint│    │                 │        │
+│  │ ❌ 检查同步性   │    │ ❌ 检查同步性   │    │ ❌ 检查同步性   │        │
+│  └─────────────────┘    └─────────────────┘    └─────────────────┘        │
+│                                                                              │
+│  ⚠️  关键限制：当前 CI 不会检查生成代码是否与 proto 同步！                     │
+│                                                                              │
+│  可能通过但实际失配的情况：                                                    │
+│  - 开发者修改了 proto 但忘记运行 buf generate                                │
+│  - 开发者运行了 buf generate 但只提交了部分生成文件                           │
+│  - CI 仍然通过（使用仓库中旧的生成代码编译）                                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 建议增强（可选但推荐）                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  建议添加的 CI 检查：                                                          │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 新增：生成代码同步性检查                                                 │  │
+│  │                                                                    │  │
+│  │ 步骤:                                                               │  │
+│  │ 1. CI 中运行 buf generate                                           │  │
+│  │ 2. 比较生成的代码与仓库中的代码                                       │  │
+│  │ 3. 如果有差异，CI 失败                                               │  │
+│  │                                                                    │  │
+│  │ 效果:                                                               │  │
+│  │ - 确保 proto 与生成代码永远同步                                      │  │
+│  │ - 开发者必须在本地运行 buf generate 并提交所有文件                    │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  建议添加的 pre-commit hook：                                                 │
+│  ├── 检查 proto 变更时生成代码是否也提交                                      │
+│  └── 运行 buf lint 和 buf breaking 检查                                      │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 10. 修正后的总结
+
+### 10.1 真实同步机制
+
+Memos 项目的 API 类型同步机制：
+
+1. **契约优先**：以 `proto/api/v1/*.proto` 作为唯一事实来源
+2. **本地生成**：开发者手动执行 `cd proto && buf generate`
+3. **手动提交**：开发者必须同时提交 `.proto` 和生成的代码
+4. **CI 有限检查**：CI 仅检查 proto 语法和代码编译，**不检查同步性**
+
+### 10.2 关键风险点
+
+| 风险 | 可能性 | 影响 | 当前防护 | 建议防护 |
+|------|--------|------|----------|----------|
+| 忘记运行 `buf generate` | 中 | 高 | 无 | pre-commit hook + CI 同步检查 |
+| 只提交部分生成文件 | 中 | 高 | 无 | pre-commit hook + CI 同步检查 |
+| 破坏性变更未检测 | 低 | 高 | 无 | `buf breaking` 检查 |
+| 生成代码冲突 | 中 | 中 | 人工解决 | 代码审查 + 小批量变更 |
+
+### 10.3 核心建议
+
+1. **封装生成流程**：使用 Makefile 或脚本将 `buf generate` 与后续检查封装为一个命令
+2. **添加 pre-commit hook**：在提交前强制检查 proto 变更与生成代码的对应关系
+3. **增强 CI 检查**（建议）：添加生成代码同步性检查，确保 proto 与生成代码永远一致
+4. **代码审查清单**：在 PR 审查时检查 proto 相关变更的完整性
+5. **破坏性变更管理**：使用 `reserved` 关键字和 `buf breaking` 检查
+
+### 10.4 后端连接层架构修正
+
+之前的描述有误，真实的后端连接层是**双层架构**：
+
+| 组件 | 职责 | 接口来源 |
+|------|------|----------|
+| `APIV1Service` | 实现业务逻辑 | `v1pb.Unimplemented*Server`（来自 `*_grpc.pb.go`） |
+| `ConnectServiceHandler` | 适配 Connect 协议 | `apiv1connect.*Handler`（来自 `*.connect.go`） |
+
+关键模式：
+- `ConnectServiceHandler` 嵌入 `APIV1Service`
+- `ConnectServiceHandler` 的方法接收 `*connect.Request[T]`，返回 `*connect.Response[T]`
+- 通过 `req.Msg` 提取内部类型，委托调用 `APIV1Service` 的方法
+- 使用 `convertGRPCError` 统一转换错误类型
+- 注册时使用 `apiv1connect.New*ServiceHandler`（注意包名是 `apiv1connect`，不是 `v1connect`）
+
+这种设计确保了：
+1. 业务逻辑只实现一次（在 `APIV1Service`）
+2. 同时支持 gRPC-Gateway 和 Connect 两种协议
+3. 所有接口和注册函数都由 `buf generate` 生成，与 proto 定义保持一致
