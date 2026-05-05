@@ -307,7 +307,7 @@ func (s *APIV1Service) GetMemo(ctx context.Context, request *v1pb.GetMemoRequest
 }
 ```
 
-**单条访问决策树**：
+**单条访问决策树**（**修正后**）：
 
 ```
 GetMemo(uid)
@@ -321,14 +321,25 @@ GetMemo(uid)
     └── memo.Visibility 检查
             ├── PUBLIC → ✓ 允许访问
             │
-            ├── PROTECTED
-            │       ├── 已登录 → ✓ 允许
-            │       └── 未登录 → Unauthenticated
-            │
-            └── PRIVATE
-                    ├── 是创作者 → ✓ 允许
-                    └── 非创作者 → PermissionDenied
+            └── memo.Visibility != PUBLIC (PROTECTED 或 PRIVATE)
+                    │
+                    ├── user == nil (未登录)
+                    │       └──→ Unauthenticated (⚠️ 关键修正：不管是 PROTECTED 还是 PRIVATE，都先要求登录)
+                    │
+                    └── user != nil (已登录)
+                            │
+                            ├── memo.Visibility == PROTECTED
+                            │       └──→ ✓ 允许访问
+                            │
+                            └── memo.Visibility == PRIVATE
+                                    ├── 是创作者 → ✓ 允许
+                                    └── 非创作者 → PermissionDenied
 ```
+
+**关键修正说明**：
+- **原错误结论**：未登录访问 PRIVATE → PermissionDenied
+- **实际代码逻辑**：未登录访问**任何非 PUBLIC**（PROTECTED 或 PRIVATE）→ **Unauthenticated**
+- 代码中先判断 `user == nil` 返回 Unauthenticated，然后才判断 `memo.Visibility == Private && memo.CreatorID != user.ID` 返回 PermissionDenied
 
 ### 4.4 ListMemoComments 评论过滤
 
