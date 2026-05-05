@@ -9,15 +9,766 @@
 | 概念 | 定义 | 存储位置 | 触发场景 |
 |------|------|----------|----------|
 | **Inbox 消息** | 用户收到的通知（评论、提及） | `inbox` 表 | 评论创建、用户被提及 |
+| **Activity 历史（旧版）** | 通用活动日志记录（已废弃） | `activity` 表（已删除） | 旧版本所有用户活动 |
+| **活动统计** | 用户备忘录创建/更新的时间统计 | 从 `memo` 表动态聚合 | 备忘录创建/更新时 |
 | **SSE 实时事件** | 服务器推送到客户端的实时更新 | 内存 (SSEHub) | 备忘录增删改、评论、反应 |
 | **Webhook** | 推送到外部系统的事件通知 | 无持久化 | 备忘录增删改、评论创建 |
 | **邮件通知** | 发送给用户的邮件提醒 | 无持久化 | Inbox 消息创建（可选） |
 
 ---
 
-## 2. 后端事件生成流程
+## 2. 旧版本 Activity 历史表与版本迁移
 
-### 2.1 触发场景
+### 2.1 Activity 表在旧版本中的角色
+
+在 Memos 的早期版本中，`activity` 表是一个通用的活动日志表，用于记录所有用户活动。
+
+**表结构定义** (`store/migration/sqlite/0.10/00__activity.sql`):
+
+```sql
+CREATE TABLE activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_id INTEGER NOT NULL,           -- 活动创建者
+  created_ts BIGINT NOT NULL DEFAULT (strftime('%s', 'now')),
+  type TEXT NOT NULL DEFAULT '',          -- 活动类型
+  level TEXT NOT NULL CHECK (level IN ('INFO', 'WARN', 'ERROR')) DEFAULT 'INFO',
+  payload TEXT NOT NULL DEFAULT '{}'      -- JSON 格式的活动载荷
+);
+```
+
+**Activity 表的职责**：
+1. 记录所有用户活动（备忘录创建、评论、提及等）
+2. 作为 Inbox 消息的"数据来源"——Inbox 表通过 `activityId` 引用 activity 表
+3. 提供活动历史查询能力
+
+### 2.2 版本迁移历史
+
+Activity 表经历了三个阶段的迁移：
+
+#### 阶段一：0.17 版本 - 清空 Activity 数据
+
+**迁移脚本** (`store/migration/sqlite/0.17/01__delete_activities.sql`):
+
+```sql
+DELETE FROM activity;
+```
+
+**背景**：在 0.17 版本引入 `inbox` 表后，系统开始逐步淘汰 `activity` 表。此迁移清空了历史数据，为后续迁移做准备。
+
+#### 阶段二：0.27 版本 - 迁移 Inbox 载荷
+
+**迁移脚本** (`store/migration/sqlite/0.27/02__migrate_inbox_message_payload.sql`):
+
+```sql
+UPDATE inbox
+SET message = json_set(
+  json_remove(message, '$.activityId'),  -- 移除 activityId 引用
+  '$.memoComment',
+  json_object(
+    'memoId',
+    (
+      -- 从 activity 表提取 memoId
+      SELECT json_extract(activity.payload, '$.memoComment.memoId')
+      FROM activity
+      WHERE activity.id = json_extract(inbox.message, '$.activityId')
+    ),
+    'relatedMemoId',
+    (
+      -- 从 activity 表提取 relatedMemoId
+      SELECT json_extract(activity.payload, '$.memoComment.relatedMemoId')
+      FROM activity
+      WHERE activity.id = json_extract(inbox.message, '$.activityId')
+    )
+  )
+)
+WHERE json_extract(message, '$.activityId') IS NOT NULL
+  AND EXISTS (
+    SELECT 1
+    FROM activity
+    WHERE activity.id = json_extract(inbox.message, '$.activityId')
+  );
+```
+
+**迁移逻辑说明**：
+
+```
+迁移前的 Inbox.message 结构：
+{
+  "activityId": 123  // 引用 activity 表的 ID
+}
+
+迁移后的 Inbox.message 结构：
+{
+  "memoComment": {          // 直接内嵌载荷
+    "memoId": 456,
+    "relatedMemoId": 789
+  }
+}
+```
+
+#### 阶段三：0.27 版本 - 删除 Activity 表
+
+**迁移脚本** (`store/migration/sqlite/0.27/03__drop_activity.sql`):
+
+```sql
+DROP TABLE activity;
+```
+
+### 2.3 迁移时间线总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Activity 表迁移时间线                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  0.10 版本                    0.17 版本                    0.27 版本        │
+│  ──────────                   ──────────                   ──────────        │
+│                                                                              │
+│  ┌─────────────┐              ┌─────────────┐              ┌─────────────┐  │
+│  │ 创建 activity│              │ 清空 activity│              │ 迁移 inbox   │  │
+│  │ 表          │              │ 表数据       │              │ 载荷         │  │
+│  └──────┬──────┘              └──────┬──────┘              └──────┬──────┘  │
+│         │                            │                            │          │
+│         ▼                            ▼                            ▼          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    Inbox 表数据结构演进                                   ││
+│  ├─────────────────────────────────────────────────────────────────────────┤│
+│  │                                                                           ││
+│  │  0.10 ~ 0.17:                                                           ││
+│  │  { "activityId": 123 }  ──────▶  引用 activity 表                     ││
+│  │                                                                           ││
+│  │  0.17 ~ 0.27:                                                           ││
+│  │  数据已清空，但结构保持不变                                              ││
+│  │                                                                           ││
+│  │  0.27 之后:                                                              ││
+│  │  { "memoComment": { "memoId": 456, "relatedMemoId": 789 } }          ││
+│  │  或 { "memoMention": { "memoId": 456, "relatedMemoId": 789 } }       ││
+│  │  ──────▶  直接内嵌载荷，不再依赖 activity 表                             ││
+│  │                                                                           ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  最终状态：activity 表被彻底删除，Inbox 表自包含所有必要数据               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 当前版本活动统计数据链路
+
+当前版本不再使用独立的 `activity` 表存储活动历史。取而代之的是：
+
+1. **通知类活动**：通过 `inbox` 表存储（评论、提及）
+2. **统计类活动**：从 `memo` 表动态聚合计算
+
+### 3.1 后端统计数据生成
+
+**代码路径**: `server/router/api/v1/user_service_stats.go`
+
+#### GetUserStats - 单用户统计
+
+```go
+func (s *APIV1Service) GetUserStats(ctx context.Context, request *v1pb.GetUserStatsRequest) (*v1pb.UserStats, error) {
+    // 1. 解析目标用户
+    user, err := ResolveUserByName(ctx, s.Store, request.Name)
+    
+    // 2. 构建备忘录查询条件
+    memoFind := &store.FindMemo{
+        CreatorID:       &userID,
+        ExcludeComments: true,    // 排除评论
+        ExcludeContent:  true,    // 不需要内容
+        RowStatus:       &normalStatus,
+    }
+    
+    // 3. 权限过滤（根据当前用户身份决定可见性）
+    if currentUser == nil {
+        memoFind.VisibilityList = []store.Visibility{store.Public}
+    } else if currentUser.ID != userID {
+        memoFind.VisibilityList = []store.Visibility{store.Public, store.Protected}
+    }
+    
+    // 4. 分批查询并聚合统计
+    createdTimestamps := []*timestamppb.Timestamp{}
+    updatedTimestamps := []*timestamppb.Timestamp{}
+    tagCount := make(map[string]int32)
+    // ... 其他统计字段
+    
+    for {
+        memos, err := s.Store.ListMemos(ctx, memoFind)
+        if len(memos) == 0 {
+            break
+        }
+        
+        for _, memo := range memos {
+            // 聚合创建时间戳（用于热力图）
+            createdTimestamps = append(createdTimestamps, 
+                timestamppb.New(time.Unix(memo.CreatedTs, 0)))
+            updatedTimestamps = append(updatedTimestamps, 
+                timestamppb.New(time.Unix(memo.UpdatedTs, 0)))
+            
+            // 统计标签数量
+            if memo.Payload != nil {
+                for _, tag := range memo.Payload.Tags {
+                    tagCount[tag]++
+                }
+                // 统计备忘录类型（链接、代码、待办等）
+                if memo.Payload.Property != nil {
+                    if memo.Payload.Property.HasLink {
+                        linkCount++
+                    }
+                    // ...
+                }
+            }
+        }
+        offset += limit
+    }
+    
+    // 5. 构建返回结果
+    return &v1pb.UserStats{
+        Name:                  fmt.Sprintf("%s/stats", BuildUserName(user.Username)),
+        MemoCreatedTimestamps: createdTimestamps,  // 关键：创建时间戳数组
+        MemoUpdatedTimestamps: updatedTimestamps,  // 关键：更新时间戳数组
+        TagCount:              tagCount,
+        TotalMemoCount:        totalMemoCount,
+        MemoTypeStats: &v1pb.UserStats_MemoTypeStats{
+            LinkCount: linkCount,
+            CodeCount: codeCount,
+            TodoCount: todoCount,
+            UndoCount: undoCount,
+        },
+        PinnedMemos: pinnedMemos,
+    }, nil
+}
+```
+
+#### ListAllUserStats - 全站统计
+
+与 `GetUserStats` 类似，但遍历所有用户的可见备忘录，用于 Explore 页面的统计展示。
+
+### 3.2 前端统计数据处理
+
+**代码路径**: `web/src/hooks/useFilteredMemoStats.ts`
+
+```typescript
+export const useFilteredMemoStats = (options: UseFilteredMemoStatsOptions = {}): FilteredMemoStats => {
+  const { userName, context } = options;
+  const currentUser = useCurrentUser();
+  const { timeBasis } = useView();  // "create_time" 或 "update_time"
+
+  // 1. 获取后端统计数据（用于 Home/Profile 页面）
+  const { data: userStats, isLoading: isLoadingUserStats } = useUserStats(userName);
+
+  // 2. 获取备忘录列表（用于 Explore 页面或 fallback）
+  const { data: memosResponse, isLoading: isLoadingMemos } = useMemos(memoQueryParams);
+
+  // 3. 聚合计算每日活动统计
+  const data = useMemo(() => {
+    let activityStats: Record<string, number> = {};  // key: "YYYY-MM-DD", value: count
+    let tagCount: Record<string, number> = {};
+
+    if (context === "explore") {
+      // Explore 页面：从可见备忘录列表计算
+      const displayDates = (memosResponse?.memos ?? [])
+        .map((memo) => memoTimestampForBasis(memo, timeBasis))
+        .filter((date): date is Date => date !== undefined)
+        .map(toDateString);  // 转为 "YYYY-MM-DD"
+      activityStats = countBy(displayDates);  // 按日期统计数量
+    } else if (userName && userStats) {
+      // Home/Profile 页面：使用后端返回的时间戳数组
+      const sourceArray = wantUpdated ? updatedArray : createdArray;
+      if (sourceArray.length > 0) {
+        activityStats = countBy(
+          sourceArray
+            .map((ts) => (ts ? timestampDate(ts) : undefined))
+            .filter((date): date is Date => date !== undefined)
+            .map(toDateString),
+        );
+      }
+      tagCount = userStats.tagCount;
+    }
+    // ... fallback 逻辑
+
+    return { statistics: { activityStats, timeBasis }, tags: tagCount, loading };
+  }, [context, userName, userStats, memosResponse, ...]);
+
+  return data;
+};
+```
+
+### 3.3 前端热力图展示
+
+**代码路径**: `web/src/components/StatisticsView/StatisticsView.tsx`
+
+```typescript
+const StatisticsView = (props: Props) => {
+  const { statisticsData } = props;
+  const { activityStats, timeBasis } = statisticsData;
+  // activityStats = { "2026-05-01": 5, "2026-05-02": 3, ... }
+
+  return (
+    <div className="group w-full mt-2 flex flex-col text-muted-foreground animate-fade-in">
+      {/* 月份导航器 */}
+      <MonthNavigator
+        visibleMonth={visibleMonthString}
+        onMonthChange={setVisibleMonthString}
+        activityStats={activityStats}
+        timeBasis={timeBasis}
+      />
+
+      {/* 月历热力图 */}
+      <MonthCalendar
+        month={visibleMonthString}
+        data={activityStats}
+        maxCount={calculateMaxCount(activityStats)}  // 用于颜色强度计算
+        onClick={navigateToDateFilter}
+        timeBasis={timeBasis}
+      />
+    </div>
+  );
+};
+```
+
+**CalendarCell 颜色强度逻辑** (`web/src/components/ActivityCalendar/utils.ts`):
+
+```typescript
+export const getCellIntensityClass = (day: CalendarDayCell, maxCount: number) => {
+  if (day.count === 0 || maxCount === 0) {
+    return "";  // 无活动：默认背景
+  }
+  
+  // 根据当天活动数量与最大值的比例，确定颜色强度
+  const ratio = day.count / maxCount;
+  
+  if (ratio >= 1) return "bg-primary/60";    // 最高强度
+  if (ratio >= 0.75) return "bg-primary/45";
+  if (ratio >= 0.5) return "bg-primary/30";
+  if (ratio >= 0.25) return "bg-primary/20";
+  return "bg-primary/10";  // 最低强度
+};
+```
+
+### 3.4 活动统计完整数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           活动统计数据完整数据流                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                              后端数据层                                        │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                              │  │
+│  │   ┌──────────┐         ┌─────────────────────────────────────────┐         │  │
+│  │   │  memo 表 │────────▶│  GetUserStats / ListAllUserStats       │         │  │
+│  │   │          │         │  (server/router/api/v1/user_service_stats.go)    │  │
+│  │   └──────────┘         └─────────────────────┬───────────────────┘         │  │
+│  │                                                │                              │  │
+│  │                                                ▼                              │  │
+│  │                                    ┌───────────────────────┐                 │  │
+│  │                                    │  UserStats Response   │                 │  │
+│  │                                    │  ┌─────────────────┐  │                 │  │
+│  │                                    │  │ memoCreated     │  │                 │  │
+│  │                                    │  │ Timestamps[]    │──┼──────▶ 热力图   │  │
+│  │                                    │  ├─────────────────┤  │                 │  │
+│  │                                    │  │ memoUpdated     │  │                 │  │
+│  │                                    │  │ Timestamps[]    │  │                 │  │
+│  │                                    │  ├─────────────────┤  │                 │  │
+│  │                                    │  │ tagCount        │──┼──────▶ 标签云   │  │
+│  │                                    │  │ memoTypeStats   │  │                 │  │
+│  │                                    │  └─────────────────┘  │                 │  │
+│  │                                    └───────────────────────┘                 │  │
+│  │                                                                              │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                              │                                       │
+│                                              ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                              前端数据层                                        │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                              │  │
+│  │   ┌──────────────────────────────────────────────────────────────────────┐  │  │
+│  │   │  useUserStats (web/src/hooks/useUserQueries.ts)                    │  │  │
+│  │   │  └─▶ 调用 userServiceClient.getUserStats()                           │  │  │
+│  │   └──────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                              │                               │  │
+│  │                                              ▼                               │  │
+│  │   ┌──────────────────────────────────────────────────────────────────────┐  │  │
+│  │   │  useFilteredMemoStats (web/src/hooks/useFilteredMemoStats.ts)      │  │  │
+│  │   │  ├─▶ 选择数据源（后端统计 或 备忘录列表）                             │  │  │
+│  │   │  ├─▶ 按日期聚合：countBy(["2026-05-01", "2026-05-01", ...])       │  │  │
+│  │   │  └─▶ 产出：{ "2026-05-01": 2, "2026-05-02": 3, ... }             │  │  │
+│  │   └──────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                              │                               │  │
+│  │                                              ▼                               │  │
+│  │   ┌──────────────────────────────────────────────────────────────────────┐  │  │
+│  │   │  StatisticsView + ActivityCalendar                                    │  │  │
+│  │   │  ├─▶ MonthNavigator：月份切换、统计汇总                               │  │  │
+│  │   │  ├─▶ MonthCalendar：月视图网格                                        │  │  │
+│  │   │  └─▶ CalendarCell：根据 count/maxCount 计算颜色强度                  │  │  │
+│  │   └──────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                              │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. ListUserNotifications 完整链路
+
+### 4.1 后端处理流程
+
+**代码路径**: `server/router/api/v1/user_service.go:1528-1595`
+
+```go
+func (s *APIV1Service) ListUserNotifications(ctx context.Context, request *v1pb.ListUserNotificationsRequest) (*v1pb.ListUserNotificationsResponse, error) {
+    // ============================================
+    // 阶段 1：权限验证
+    // ============================================
+    user, err := s.resolveUserFromName(ctx, request.Parent)  // 从 "users/xxx" 解析用户
+    userID := user.ID
+
+    currentUser, err := s.fetchCurrentUser(ctx)
+    if currentUser.ID != userID {
+        return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+    }
+
+    // ============================================
+    // 阶段 2：从存储层获取 Inbox 数据
+    // ============================================
+    inboxes, err := s.Store.ListInboxes(ctx, &store.FindInbox{
+        ReceiverID: &userID,  // 只查询当前用户的收件箱
+    })
+
+    // ============================================
+    // 阶段 3：批量获取关联数据（优化 N+1 查询）
+    // ============================================
+    // 收集所有需要查询的用户 ID
+    userIDs := make([]int32, 0, len(inboxes)*2)
+    for _, inbox := range inboxes {
+        userIDs = append(userIDs, inbox.ReceiverID, inbox.SenderID)
+    }
+    usersByID, err := s.listUsersByID(ctx, userIDs)  // 批量查询用户
+
+    // 收集所有需要查询的备忘录 ID
+    memosByID, err := s.listMemosByID(ctx, collectInboxMemoIDs(inboxes))  // 批量查询备忘录
+
+    // ============================================
+    // 阶段 4：转换为 API 层结构
+    // ============================================
+    notifications := []*v1pb.UserNotification{}
+    for _, inbox := range inboxes {
+        notification, err := s.convertInboxToUserNotificationWithUsersAndMemos(
+            inbox, currentUser, usersByID, memosByID)
+        if err != nil {
+            if status.Code(err) == codes.NotFound {
+                // 跳过引用已删除数据的通知
+                slog.Warn("Skipping notification with missing user", ...)
+                continue
+            }
+            return nil, status.Errorf(codes.Internal, "failed to convert inbox: %v", err)
+        }
+        if notification.Type == v1pb.UserNotification_TYPE_UNSPECIFIED {
+            continue  // 跳过未知类型
+        }
+        notifications = append(notifications, notification)
+    }
+
+    // ============================================
+    // 阶段 5：返回结果
+    // ============================================
+    return &v1pb.ListUserNotificationsResponse{
+        Notifications: notifications,
+    }, nil
+}
+```
+
+### 4.2 Inbox 到 UserNotification 的转换
+
+**代码路径**: `server/router/api/v1/user_service.go:1753-1811`
+
+```go
+func (s *APIV1Service) convertInboxToUserNotificationWithUsersAndMemos(
+    inbox *store.Inbox, 
+    viewer *store.User, 
+    usersByID map[int32]*store.User, 
+    memosByID map[int32]*store.Memo,
+) (*v1pb.UserNotification, error) {
+    // ============================================
+    // 1. 基础字段映射
+    // ============================================
+    receiver := usersByID[inbox.ReceiverID]
+    sender := usersByID[inbox.SenderID]
+
+    notification := &v1pb.UserNotification{
+        Name:       fmt.Sprintf("%s/notifications/%d", BuildUserName(receiver.Username), inbox.ID),
+        Sender:     BuildUserName(sender.Username),
+        SenderUser: convertUserFromStore(sender, viewer),  // 完整的用户信息
+        CreateTime: timestamppb.New(time.Unix(inbox.CreatedTs, 0)),
+    }
+
+    // ============================================
+    // 2. 状态转换
+    // ============================================
+    switch inbox.Status {
+    case store.UNREAD:
+        notification.Status = v1pb.UserNotification_UNREAD
+    case store.ARCHIVED:
+        notification.Status = v1pb.UserNotification_ARCHIVED
+    default:
+        notification.Status = v1pb.UserNotification_STATUS_UNSPECIFIED
+    }
+
+    // ============================================
+    // 3. 类型和载荷转换
+    // ============================================
+    if inbox.Message != nil {
+        switch inbox.Message.Type {
+        case storepb.InboxMessage_MEMO_COMMENT:
+            notification.Type = v1pb.UserNotification_MEMO_COMMENT
+            payload, err := s.convertMemoCommentNotificationPayload(viewer, inbox.Message, memosByID)
+            if payload != nil {
+                notification.Payload = &v1pb.UserNotification_MemoComment{
+                    MemoComment: payload,
+                }
+            }
+
+        case storepb.InboxMessage_MEMO_MENTION:
+            notification.Type = v1pb.UserNotification_MEMO_MENTION
+            payload, err := s.convertMemoMentionNotificationPayload(viewer, inbox.Message, memosByID)
+            if payload != nil {
+                notification.Payload = &v1pb.UserNotification_MemoMention{
+                    MemoMention: payload,
+                }
+            }
+
+        default:
+            notification.Type = v1pb.UserNotification_TYPE_UNSPECIFIED
+        }
+    }
+
+    return notification, nil
+}
+```
+
+### 4.3 载荷转换（含内容摘要）
+
+**代码路径**: `server/router/api/v1/user_service.go:1841-1900+`
+
+```go
+func (s *APIV1Service) convertMemoCommentNotificationPayload(
+    viewer *store.User, 
+    message *storepb.InboxMessage, 
+    memosByID map[int32]*store.Memo,
+) (*v1pb.UserNotification_MemoCommentPayload, error) {
+    memoComment := message.GetMemoComment()
+    
+    // 1. 获取关联的备忘录
+    commentMemo := memosByID[memoComment.MemoId]
+    relatedMemo := memosByID[memoComment.RelatedMemoId]
+    
+    // 2. 权限检查（确保接收者能看到这些备忘录）
+    if !canViewerAccessMemo(viewer, commentMemo) || !canViewerAccessMemo(viewer, relatedMemo) {
+        return nil, nil  // 无权限则返回空载荷
+    }
+    
+    // 3. 生成内容摘要（用于前端展示）
+    memoSnippet, err := s.memoNotificationSnippet(commentMemo)  // 截取前 64 字符
+    relatedMemoSnippet, err := s.memoNotificationSnippet(relatedMemo)
+    
+    // 4. 构建返回载荷
+    return &v1pb.UserNotification_MemoCommentPayload{
+        Memo:                BuildMemoName(commentMemo.UID),           // 资源名
+        MemoSnippet:         memoSnippet,                                // 摘要
+        RelatedMemo:         BuildMemoName(relatedMemo.UID),           // 原备忘录
+        RelatedMemoSnippet:  relatedMemoSnippet,                        // 原备忘录摘要
+    }, nil
+}
+```
+
+### 4.4 更新通知状态
+
+**代码路径**: `server/router/api/v1/user_service.go:1597-1669`
+
+```go
+func (s *APIV1Service) UpdateUserNotification(ctx context.Context, request *v1pb.UpdateUserNotificationRequest) (*v1pb.UserNotification, error) {
+    // 1. 解析通知名称 "users/xxx/notifications/123"
+    user, notificationID, err := s.resolveUserAndNotificationIDFromName(ctx, request.Notification.Name)
+    
+    // 2. 权限验证
+    currentUser, err := s.fetchCurrentUser(ctx)
+    if currentUser.ID != user.ID {
+        return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+    }
+    
+    // 3. 验证所有权（确保通知属于当前用户）
+    inboxes, err := s.Store.ListInboxes(ctx, &store.FindInbox{ID: &notificationID})
+    inbox := inboxes[0]
+    if inbox.ReceiverID != currentUser.ID {
+        return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+    }
+    
+    // 4. 构建更新请求
+    update := &store.UpdateInbox{
+        ID: notificationID,
+    }
+    
+    for _, path := range request.UpdateMask.Paths {
+        switch path {
+        case "status":
+            var inboxStatus store.InboxStatus
+            switch request.Notification.Status {
+            case v1pb.UserNotification_UNREAD:
+                inboxStatus = store.UNREAD
+            case v1pb.UserNotification_ARCHIVED:
+                inboxStatus = store.ARCHIVED
+            default:
+                return nil, status.Errorf(codes.InvalidArgument, "invalid status")
+            }
+            update.Status = inboxStatus
+        // 目前只支持更新 status
+        }
+    }
+    
+    // 5. 执行更新
+    updatedInbox, err := s.Store.UpdateInbox(ctx, update)
+    
+    // 6. 转换并返回
+    notification, err := s.convertInboxToUserNotification(ctx, updatedInbox, currentUser)
+    return notification, nil
+}
+```
+
+### 4.5 ListUserNotifications 完整时序图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                        ListUserNotifications 完整时序图                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  前端组件                    Connect RPC                 后端服务                         │
+│  ────────                    ───────────                 ────────                         │
+│                                                                                          │
+│  ┌──────────┐                                                                           │
+│  │ Inboxes  │                                                                           │
+│  │ 页面     │                                                                           │
+│  └────┬─────┘                                                                           │
+│       │                                                                                 │
+│       │  1. useNotifications()                                                          │
+│       │  ─────────────────────────────────────────────────────────────────────────▶    │
+│       │                                                                                 │
+│       ▼                                                                                 │
+│  ┌──────────────────┐                                                                   │
+│  │ useUserQueries.ts│                                                                   │
+│  │ useNotifications │                                                                   │
+│  └─────────┬────────┘                                                                   │
+│            │                                                                            │
+│            │  2. React Query 检查缓存                                                   │
+│            │     - 有缓存且 staleTime(30s) 未过期：直接返回                            │
+│            │     - 无缓存或已过期：调用 API                                            │
+│            │                                                                             │
+│            ▼                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Connect RPC 调用                                               │  │
+│  │  userServiceClient.listUserNotifications({ parent: "users/xxx" })              │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+│            │                                                                             │
+│            ▼                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                         后端服务处理                                              │  │
+│  ├──────────────────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                                   │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 阶段 1：权限验证                                                         │   │  │
+│  │  │ - 从 "users/xxx" 解析目标用户 ID                                        │   │  │
+│  │  │ - 验证当前用户是否为目标用户本人                                         │   │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                    │                                              │  │
+│  │                                    ▼                                              │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 阶段 2：数据查询                                                         │   │  │
+│  │  │ - Store.ListInboxes(ctx, &FindInbox{ReceiverID: &userID})             │   │  │
+│  │  │   └─▶ SELECT * FROM inbox WHERE receiver_id = ? ORDER BY created_ts DESC│   │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                    │                                              │  │
+│  │                                    ▼                                              │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 阶段 3：批量获取关联数据（优化 N+1）                                     │   │  │
+│  │  │ - 收集所有 sender_id, receiver_id → 批量查询用户                        │   │  │
+│  │  │ - 收集所有 memo_id, related_memo_id → 批量查询备忘录                    │   │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                    │                                              │  │
+│  │                                    ▼                                              │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 阶段 4：转换为 API 结构                                                  │   │  │
+│  │  │ - convertInboxToUserNotificationWithUsersAndMemos()                    │   │  │
+│  │  │   ├─▶ 构建资源名："users/xxx/notifications/123"                        │   │  │
+│  │  │   ├─▶ 转换状态：UNREAD/ARCHIVED                                         │   │  │
+│  │  │   ├─▶ 转换类型：MEMO_COMMENT/MEMO_MENTION                               │   │  │
+│  │  │   ├─▶ 构建载荷（含内容摘要）                                             │   │  │
+│  │  │   └─▶ 权限检查：跳过接收者无权限访问的通知                               │   │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                    │                                              │  │
+│  │                                    ▼                                              │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 阶段 5：返回响应                                                         │   │  │
+│  │  │ - ListUserNotificationsResponse{ Notifications: [...] }                 │   │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                                                                   │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+│            │                                                                             │
+│            ▼                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                         前端数据处理                                              │  │
+│  ├──────────────────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                                   │  │
+│  │  1. React Query 缓存响应数据                                                     │  │
+│  │     queryKey: ["users", "notifications"]                                        │  │
+│  │     staleTime: 30 秒                                                             │  │
+│  │                                                                                   │  │
+│  │  2. Inboxes.tsx 处理数据                                                         │  │
+│  │     - 按 created_ts 倒序排序                                                     │  │
+│  │     - 过滤显示：all / unread / archived                                         │  │
+│  │     - 统计未读数量：unreadCount                                                  │  │
+│  │                                                                                   │  │
+│  │  3. 渲染组件                                                                      │  │
+│  │     - MEMO_COMMENT → MemoCommentMessage.tsx                                     │  │
+│  │     - MEMO_MENTION → MemoMentionMessage.tsx                                     │  │
+│  │                                                                                   │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. 旧 Activity 与现有 Inbox/统计 对照表
+
+| 维度 | 旧版 Activity 表 (≤ 0.26) | 现有 Inbox 表 (≥ 0.27) | 现有活动统计 (动态聚合) |
+|------|---------------------------|------------------------|------------------------|
+| **数据来源** | 独立的 `activity` 表 | `inbox` 表 | 从 `memo` 表动态聚合 |
+| **存储方式** | 独立表，Inbox 通过 `activityId` 引用 | 自包含，载荷直接内嵌在 `message` 字段 | 无持久化，按需计算 |
+| **触发场景** | 所有用户活动 | 仅评论、提及等需用户注意的事件 | 备忘录创建/更新 |
+| **数据结构** | 通用结构：`type`, `level`, `payload` | 专用结构：`MEMO_COMMENT`, `MEMO_MENTION` | 时间戳数组、标签计数等 |
+| **前端展示** | - | Inbox 通知页面、导航栏角标 | 热力图、标签云、统计面板 |
+| **查询方式** | 直接查询 `activity` 表 | 查询 `inbox` 表（按 receiver_id 过滤） | 查询 `memo` 表后聚合 |
+| **权限控制** | - | 仅接收者本人可查看 | 根据备忘录 visibility 过滤 |
+| **状态管理** | - | UNREAD / ARCHIVED | 无状态概念 |
+| **迁移状态** | 已删除 (`DROP TABLE`) | 当前使用中 | 当前使用中 |
+
+### 5.1 数据迁移映射表
+
+| 旧版结构 | 新版结构 | 迁移方式 |
+|----------|----------|----------|
+| `inbox.message.activityId` | 已移除 | 迁移时提取数据后删除此字段 |
+| `activity.payload.memoComment.memoId` | `inbox.message.memoComment.memoId` | 从 activity 表提取后内嵌 |
+| `activity.payload.memoComment.relatedMemoId` | `inbox.message.memoComment.relatedMemoId` | 从 activity 表提取后内嵌 |
+| `activity` 表本身 | 已删除 | 迁移完成后 `DROP TABLE` |
+
+---
+
+## 6. 后端事件生成流程
+
+### 6.1 触发场景
 
 系统中有两个主要场景会生成 Inbox 消息：
 
@@ -93,7 +844,7 @@ func (s *APIV1Service) dispatchMemoMentionNotifications(ctx context.Context, mem
 }
 ```
 
-### 2.2 提及过滤逻辑
+### 6.2 提及过滤逻辑
 
 系统会智能过滤不需要发送通知的情况：
 
@@ -119,9 +870,9 @@ func shouldSkipMentionInbox(target *store.User, memo *store.Memo, relatedMemo *s
 
 ---
 
-## 3. 数据存储层
+## 7. 数据存储层
 
-### 3.1 数据结构定义
+### 7.1 数据结构定义
 
 **Proto 定义**: `proto/store/inbox.proto`
 
@@ -166,7 +917,7 @@ type Inbox struct {
 }
 ```
 
-### 3.2 数据库表结构
+### 7.2 数据库表结构
 
 **迁移脚本**: `store/migration/sqlite/0.17/00__inbox.sql`
 
@@ -185,7 +936,7 @@ CREATE INDEX IF NOT EXISTS `idx_inbox_receiver_id` ON `inbox`(`receiver_id`);
 CREATE INDEX IF NOT EXISTS `idx_inbox_status` ON `inbox`(`status`);
 ```
 
-### 3.3 存储操作
+### 7.3 存储操作
 
 **SQLite 实现**: `store/db/sqlite/inbox.go`
 
@@ -200,7 +951,7 @@ CREATE INDEX IF NOT EXISTS `idx_inbox_status` ON `inbox`(`status`);
 
 ---
 
-## 4. 多通道通知分发
+## 8. 多通道通知分发
 
 当 Inbox 消息创建时，系统会通过多个通道进行通知分发：
 
@@ -218,7 +969,7 @@ CREATE INDEX IF NOT EXISTS `idx_inbox_status` ON `inbox`(`status`);
     └─────────────────┘        └─────────────────┘        └─────────────────┘
 ```
 
-### 4.1 核心分发入口
+### 8.1 核心分发入口
 
 **代码路径**: `server/router/api/v1/notification_email.go:11-28`
 
@@ -236,7 +987,7 @@ func (s *APIV1Service) createInboxWithEmailNotification(ctx context.Context, inb
 }
 ```
 
-### 4.2 邮件通知
+### 8.2 邮件通知
 
 **代码路径**: `server/notification/email.go:40-97`
 
@@ -280,7 +1031,7 @@ https://your-memos-instance.com/memos/xxx#yyy
 You are receiving this because you own this memo.
 ```
 
-### 4.3 SSE 实时事件（独立通道）
+### 8.3 SSE 实时事件（独立通道）
 
 **注意**: SSE 事件与 Inbox 消息是**独立的两个系统**，但有部分重叠场景。
 
@@ -382,7 +1133,7 @@ s.SSEHub.Broadcast(&SSEEvent{
 })
 ```
 
-### 4.4 Webhook 通知（独立通道）
+### 8.4 Webhook 通知（独立通道）
 
 Webhook 用于将事件推送到外部系统，与 Inbox 消息也是独立的。
 
@@ -428,9 +1179,9 @@ type WebhookRequestPayload struct {
 
 ---
 
-## 5. 前端数据流
+## 9. 前端数据流
 
-### 5.1 整体架构
+### 9.1 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -451,7 +1202,7 @@ type WebhookRequestPayload struct {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 SSE 实时连接管理
+### 9.2 SSE 实时连接管理
 
 **代码路径**: `web/src/hooks/useLiveMemoRefresh.ts`
 
@@ -526,7 +1277,7 @@ function handleSSEEvent(event: SSEChangeEvent, queryClient: QueryClient) {
 
 **重要发现**: `memo.comment.created` 事件目前不会触发通知列表的刷新。这意味着新的 Inbox 消息到达时，前端可能不会立即感知，需要依赖 `useNotifications` 的 `staleTime` 过期后重新拉取。
 
-### 5.3 通知数据获取
+### 9.3 通知数据获取
 
 **代码路径**: `web/src/hooks/useUserQueries.ts:61-76`
 
@@ -552,7 +1303,7 @@ export function useNotifications() {
 }
 ```
 
-### 5.4 UI 展示层
+### 9.4 UI 展示层
 
 #### 导航栏通知入口
 
@@ -675,9 +1426,9 @@ function MemoMentionMessage({ notification }: Props) {
 
 ---
 
-## 6. 完整数据流时序图
+## 10. 完整数据流时序图
 
-### 6.1 创建评论触发通知
+### 10.1 创建评论触发通知
 
 ```
 ┌─────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐     ┌──────────┐
@@ -715,7 +1466,7 @@ function MemoMentionMessage({ notification }: Props) {
      │                  │                     │                     │                  │
 ```
 
-### 6.2 前端实时更新流程
+### 10.2 前端实时更新流程
 
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌───────────────┐     ┌─────────────┐
@@ -744,88 +1495,4 @@ function MemoMentionMessage({ notification }: Props) {
        │                        │                      │<────────────────────│
        │                        │                      │                    │
        │                        │                      │ 5. 通知更新          │                    │
-       │                        │                      │────────────────────>│
-       │                        │                      │                    │ 重新渲染
-       │                        │                      │                    │ 未读计数更新
-```
-
----
-
-## 7. 关键数据结构映射关系
-
-### 7.1 后端到前端的转换
-
-| 后端 (Go) | 前端 (TypeScript) | 说明 |
-|-----------|-------------------|------|
-| `store.Inbox` | `UserNotification` | 通过 API 层转换 |
-| `storepb.InboxMessage_MEMO_COMMENT` | `UserNotification_Type.MEMO_COMMENT` | 评论通知类型 |
-| `storepb.InboxMessage_MEMO_MENTION` | `UserNotification_Type.MEMO_MENTION` | 提及通知类型 |
-| `store.UNREAD` | `UserNotification_Status.UNREAD` | 未读状态 |
-| `store.ARCHIVED` | `UserNotification_Status.ARCHIVED` | 已归档状态 |
-
-### 7.2 事件与通知的对应关系
-
-| 事件类型 | 是否生成 Inbox | 是否触发 SSE | 是否触发 Webhook |
-|----------|----------------|--------------|------------------|
-| 备忘录创建 | ❌ 否 | ✅ 是 | ✅ 是 |
-| 备忘录更新 | ❌ 否 | ✅ 是 | ✅ 是 |
-| 备忘录删除 | ❌ 否 | ✅ 是 | ✅ 是 |
-| 评论创建 | ✅ 是 (通知原作者) | ✅ 是 | ✅ 是 |
-| 用户被提及 | ✅ 是 (通知被提及者) | ❌ 否 | ❌ 否 |
-| 反应添加/删除 | ❌ 否 | ✅ 是 | ❌ 否 |
-
----
-
-## 8. 架构总结
-
-### 8.1 系统设计亮点
-
-1. **多通道通知**: Inbox 消息 + 邮件 + SSE + Webhook，满足不同场景需求
-2. **尽力而为模式**: 邮件和 Webhook 采用异步发送，失败不影响主流程
-3. **权限控制**: SSE 广播时根据备忘录可见性过滤接收者
-4. **智能去重**: 评论场景中避免重复发送通知（原作者已收到评论通知，不再发送提及通知）
-5. **前端缓存优化**: React Query + SSE 实现高效的实时更新
-
-### 8.2 潜在改进点
-
-1. **SSE 事件与 Inbox 的联动**
-   - 目前 `memo.comment.created` 事件不会触发通知列表刷新
-   - 建议：当收到评论或提及相关的 SSE 事件时，主动使 `userKeys.notifications()` 缓存失效
-
-2. **通知类型扩展**
-   - 目前只支持 `MEMO_COMMENT` 和 `MEMO_MENTION`
-   - 可考虑扩展：`REACTION_CREATED`（有人点赞/反应）、`MEMO_SHARED`（备忘录被共享）等
-
-3. **批量操作支持**
-   - 前端目前只能单条标记已读/删除
-   - 可考虑添加"全部标记已读"功能
-
----
-
-## 9. 相关文件索引
-
-### 后端
-
-| 文件路径 | 职责 |
-|----------|------|
-| `store/inbox.go` | Inbox 数据结构定义 |
-| `store/db/sqlite/inbox.go` | SQLite 存储实现 |
-| `proto/store/inbox.proto` | Protobuf 定义 |
-| `server/router/api/v1/memo_service.go` | 评论创建、事件广播 |
-| `server/router/api/v1/memo_mention_helpers.go` | 提及解析与通知分发 |
-| `server/router/api/v1/notification_email.go` | Inbox + 邮件通知入口 |
-| `server/notification/email.go` | 邮件通知构建与发送 |
-| `server/router/api/v1/sse_hub.go` | SSE 连接管理与广播 |
-| `server/router/api/v1/sse_handler.go` | SSE HTTP 处理器 |
-| `internal/webhook/webhook.go` | Webhook 异步发送 |
-
-### 前端
-
-| 文件路径 | 职责 |
-|----------|------|
-| `web/src/hooks/useLiveMemoRefresh.ts` | SSE 连接管理与事件处理 |
-| `web/src/hooks/useUserQueries.ts` | 通知数据获取 Hook |
-| `web/src/pages/Inboxes.tsx` | Inbox 页面主组件 |
-| `web/src/components/Navigation.tsx` | 导航栏通知入口 |
-| `web/src/components/Inbox/MemoMentionMessage.tsx` | 提及通知组件 |
-| `web/src/components/Inbox/MemoCommentMessage.tsx` | 评论通知组件 |
+       │                        │                      │────────────────────>
