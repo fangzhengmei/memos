@@ -6,15 +6,57 @@ Memos 支持两种与 iframe 相关的场景：
 1. **在 Memo 内容中嵌入外部 iframe**：例如 YouTube、Vimeo 视频等（通过 TrustedIframe 组件）
 2. **将 Memo 以 iframe 方式嵌入外部页面**：通过分享链接机制实现（MemoShare）
 
-本文档重点分析第二种场景：**跨域 iframe 嵌入时的服务端 token 校验和内容权限控制机制**。
+本文档重点分析第二种场景：**外部页面通过 iframe 嵌入 Memos 分享页面时的服务端 token 校验和内容权限控制机制**。
 
 ---
 
-## 二、Memo 分享链接机制
+## 二、核心概念澄清：同源 vs 跨域
 
-### 2.1 核心数据结构
+### 2.1 关键理解
 
-分享链接的核心数据结构定义在 `store/memo_share.go`：
+**当外部页面通过 iframe 嵌入 Memos 分享页面时**：
+
+```
+外部页面 (https://external.com)
+  └── <iframe src="https://memos.example.com/memos/shares/TOKEN">
+          │
+          └── 页面内的 JavaScript 运行在 https://memos.example.com 上下文中
+                  │
+                  └── 调用 API: https://memos.example.com/memos.api.v1.MemoService/GetMemoByShare
+                          │
+                          └── 这是【同源请求】！不是跨域请求
+```
+
+**关键点**：
+- iframe 内的页面是从 `https://memos.example.com` 加载的
+- 页面内的 JavaScript 的 `window.location.origin` 是 `https://memos.example.com`
+- 发起的 API 请求目标也是 `https://memos.example.com`
+- 浏览器将此视为**同源请求**，不受 CORS 限制
+
+### 2.2 真正的跨域场景
+
+真正需要考虑 CORS 的场景是：**外部页面的 JavaScript 直接调用 Memos API（不通过 iframe）**
+
+```
+外部页面 (https://external.com) 的 JavaScript
+  └── fetch("https://memos.example.com/api/v1/shares/TOKEN")
+          │
+          └── 这是【跨域请求】
+                  │
+                  └── 受 CORS 限制
+```
+
+这种场景相对少见，因为：
+- 外部页面通常无法获取有效的认证 token
+- 分享功能设计为通过 iframe 嵌入整个页面使用
+
+---
+
+## 三、Memo 分享链接机制
+
+### 3.1 核心数据结构
+
+分享链接的核心数据结构定义在 `store/memo_share.go:5-13`：
 
 ```go
 type MemoShare struct {
@@ -27,12 +69,12 @@ type MemoShare struct {
 }
 ```
 
-**Token 生成方式**：
+**Token 生成方式**（`server/router/api/v1/memo_share_service.go:56-58`）：
 - 使用 `shortuuid/v4` 库生成 URL 安全的 token
 - 格式：base57 编码的 UUID v4，共 22 字符
 - 熵值：122-bit，安全性较高
 
-### 2.2 分享链接 URL 格式
+### 3.2 分享链接 URL 格式
 
 前端生成的分享链接格式（`web/src/hooks/useMemoShareQueries.ts:82-84`）：
 
@@ -45,13 +87,30 @@ type MemoShare struct {
 https://memos.example.com/memos/shares/2v9xQ8ZkLmNpR7sT3uW5y
 ```
 
+### 3.3 前端 API 调用方式
+
+前端使用 **Connect RPC** 风格调用 API，配置在 `web/src/connect.ts:184-189`：
+
+```typescript
+const transport = createConnectTransport({
+    baseUrl: window.location.origin,  // 关键：使用当前页面的 origin
+    useBinaryFormat: true,
+    fetch: fetchWithCredentials,
+    interceptors: [authInterceptor],
+});
+```
+
+**请求路径**：
+- Connect RPC 风格：`/memos.api.v1.MemoService/GetMemoByShare`
+- 不是 gRPC-Gateway 的 REST 风格：`/api/v1/shares/{share_id}`
+
 ---
 
-## 三、服务端 Token 校验流程
+## 四、服务端 Token 校验流程
 
-### 3.1 API 权限配置
+### 4.1 API 权限配置
 
-首先，获取分享 memo 的 API 被显式标记为公开方法（`server/router/api/v1/acl_config.go:39`）：
+获取分享 memo 的 API 被显式标记为公开方法（`server/router/api/v1/acl_config.go:39`）：
 
 ```go
 var PublicMethods = map[string]struct{}{
@@ -64,7 +123,7 @@ var PublicMethods = map[string]struct{}{
 - `GetMemoByShare` API 调用**不需要** Authorization header
 - 其他分享相关 API（Create/List/Delete）**需要**认证，且仅限 memo 创建者或管理员
 
-### 3.2 Token 校验逻辑
+### 4.2 Token 校验逻辑
 
 核心校验逻辑在 `server/router/api/v1/memo_share_service.go:199-208`：
 
@@ -92,7 +151,7 @@ func isMemoShareExpired(ms *store.MemoShare) bool {
 2. **过期检查**：如果设置了 `ExpiresTs`，当前时间必须小于过期时间
 3. **信息泄露防护**：无效或过期的 token 都返回 `NOT_FOUND`，不区分具体原因
 
-### 3.3 Memo 内容获取流程
+### 4.3 Memo 内容获取流程
 
 完整的 `GetMemoByShare` 方法（`server/router/api/v1/memo_share_service.go:151-192`）：
 
@@ -131,9 +190,9 @@ func (s *APIV1Service) GetMemoByShare(ctx context.Context, request *v1pb.GetMemo
 
 ---
 
-## 四、附件访问权限控制
+## 五、附件访问权限控制
 
-### 4.1 附件 URL 重写
+### 5.1 附件 URL 重写
 
 前端在分享模式下会重写附件 URL，添加 `share_token` 参数（`web/src/hooks/useMemoShareQueries.ts:96-100`）：
 
@@ -154,7 +213,7 @@ export function withShareAttachmentLinks(attachments: Attachment[], token: strin
 {origin}/file/attachments/{attachmentUID}/{filename}?share_token={shareToken}
 ```
 
-### 4.2 服务端附件权限校验
+### 5.2 服务端附件权限校验
 
 文件服务器的权限校验逻辑（`server/router/fileserver/fileserver.go:636-688`）：
 
@@ -240,13 +299,51 @@ func (s *FileServerService) checkAttachmentPermission(ctx context.Context, c *ec
 
 ---
 
-## 五、跨域 (CORS) 处理
+## 六、CORS 配置分析（修正）
 
-### 5.1 API 层 CORS 配置
+### 6.1 服务端有两套 API 接口
 
-API 层有两套不同的 CORS 策略（`server/router/api/v1/v1.go:130-165`）：
+Memos 服务端提供了**两套独立的 API 接口**，分别有不同的 CORS 策略：
 
-#### gRPC-Gateway（/api/v1/* 路由）
+| 接口类型 | 路径模式 | CORS 策略 | 主要使用者 |
+|---------|---------|----------|-----------|
+| Connect RPC | `/memos.api.v1.*` | 严格（同源或 InstanceURL） | 浏览器前端（主应用） |
+| gRPC-Gateway (REST) | `/api/v1/*` | 宽松（`AllowOrigins: ["*"]`） | 第三方集成、非浏览器客户端 |
+
+### 6.2 Connect RPC 的 CORS 配置
+
+Connect RPC 使用严格的 CORS 策略（`server/router/api/v1/v1.go:153-163`）：
+
+```go
+corsHandler := middleware.CORSWithConfig(middleware.CORSConfig{
+    UnsafeAllowOriginFunc: func(c *echo.Context, origin string) (string, bool, error) {
+        // 仅允许：
+        // 1. 同源（origin 匹配请求的 Host）
+        if strings.EqualFold(originURL.Host, c.Request().Host) {
+            return origin, true, nil
+        }
+        // 2. 配置的 InstanceURL
+        instanceURL, _ := url.Parse(s.Profile.InstanceURL)
+        return strings.EqualFold(originURL.Scheme, instanceURL.Scheme) && 
+               strings.EqualFold(originURL.Host, instanceURL.Host), true, nil
+    },
+    AllowCredentials: true,  // 允许携带 cookies
+})
+```
+
+**设计目的**：
+- 保护需要认证的 API 端点
+- 防止 CSRF 攻击
+- 允许携带 credentials（cookies）
+
+**与 iframe 嵌入的关系**：
+- 当 iframe 内的页面发起请求时，这是**同源请求**
+- 浏览器不会发送 `Origin` 头，或发送的 `Origin` 等于目标域名
+- 因此**不会触发 CORS 预检**，直接放行
+
+### 6.3 gRPC-Gateway 的 CORS 配置
+
+gRPC-Gateway 使用宽松的 CORS 策略（`server/router/api/v1/v1.go:130-132`）：
 
 ```go
 gwGroup.Use(middleware.CORSWithConfig(middleware.CORSConfig{
@@ -254,47 +351,42 @@ gwGroup.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 }))
 ```
 
-**特点**：
-- `Access-Control-Allow-Origin: *`
-- 适用于 `/api/v1/*` 路由
-- 这意味着 **GetMemoByShare API 可以从任何域名调用**
+**设计目的**：
+- 允许第三方集成（如 MCP 服务器、移动应用、命令行工具等）
+- 提供 RESTful API 接口供非浏览器客户端使用
 
-#### Connect 处理器（/memos.api.v1.* 路由）
+**与 iframe 嵌入的关系**：
+- 前端**不使用**这套接口
+- iframe 嵌入场景**不涉及**这套 CORS 配置
+- 这是我之前分析的主要错误点
 
-```go
-corsHandler := middleware.CORSWithConfig(middleware.CORSConfig{
-    UnsafeAllowOriginFunc: func(c *echo.Context, origin string) (string, bool, error) {
-        // 仅允许同源或配置的 InstanceURL
-        if strings.EqualFold(originURL.Host, c.Request().Host) {
-            return origin, true, nil
-        }
-        // 检查是否匹配配置的 InstanceURL
-        instanceURL, _ := url.Parse(s.Profile.InstanceURL)
-        return strings.EqualFold(originURL.Scheme, instanceURL.Scheme) && 
-               strings.EqualFold(originURL.Host, instanceURL.Host), true, nil
-    },
-    AllowCredentials: true,
-})
+### 6.4 前端实际使用的接口
+
+前端 `connect.ts` 的配置（`web/src/connect.ts:184-189`）：
+
+```typescript
+const transport = createConnectTransport({
+    baseUrl: window.location.origin,  // 使用当前页面的 origin
+    // ...
+});
 ```
 
-**特点**：
-- 仅允许同源或配置的 `InstanceURL`
-- 允许携带 credentials（cookies）
-- 浏览器客户端主要使用这套
+结合 `useMemoShareQueries.ts` 的调用（`web/src/hooks/useMemoShareQueries.ts:70`）：
 
-### 5.2 前端 SPA 页面的 CORS
+```typescript
+const memo = await memoServiceClient.getMemoByShare(create(GetMemoByShareRequestSchema, { shareId }));
+```
 
-前端 SPA 页面（包括分享页面 `/memos/shares/:token`）由 `frontend` 服务提供，**没有显式的 CORS 限制**。
-
-这意味着：
-- 外部页面可以通过 `<iframe src="https://memos.example.com/memos/shares/xxx">` 嵌入分享页面
-- 但嵌入后，iframe 内的 API 调用会受 API 层 CORS 策略影响
+**实际请求**：
+- 目标 URL：`https://memos.example.com/memos.api.v1.MemoService/GetMemoByShare`
+- 使用 Connect RPC 格式，不是 REST 格式
+- 这是**同源请求**，不受 CORS 限制
 
 ---
 
-## 六、安全头部与 iframe 嵌入限制
+## 七、Iframe 嵌入的安全考量
 
-### 6.1 文件服务器的安全头部
+### 7.1 文件服务器的安全头部
 
 文件服务器设置了严格的安全头部（`server/router/fileserver/fileserver.go:742-747`）：
 
@@ -302,39 +394,52 @@ corsHandler := middleware.CORSWithConfig(middleware.CORSConfig{
 func setSecurityHeaders(c *echo.Context) {
     h := c.Response().Header()
     h.Set("X-Content-Type-Options", "nosniff")
-    h.Set("X-Frame-Options", "DENY")  // 关键：禁止 iframe 嵌入
+    h.Set("X-Frame-Options", "DENY")  // 禁止 iframe 嵌入
     h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline';")
 }
 ```
 
-**影响**：
-- `X-Frame-Options: DENY` 会阻止浏览器在 iframe 中渲染文件服务器的响应
-- 这意味着 **附件文件无法直接通过 iframe 嵌入**
-- 但 SPA 前端页面不受此限制（该头部仅在文件服务中设置）
+**影响范围**：
+- 仅影响 `/file/*` 路径下的文件访问
+- **不影响**前端 SPA 页面
+- 附件文件无法直接通过 iframe 嵌入，但可以通过 `<img>`、`<video>` 等标签加载
 
-### 6.2 实际嵌入场景
+### 7.2 前端 SPA 页面的嵌入能力
 
-可行的嵌入方式：
-1. **嵌入整个分享页面**（推荐）：
-   ```html
-   <iframe src="https://memos.example.com/memos/shares/2v9xQ8ZkLmNpR7sT3uW5y"></iframe>
-   ```
-   - 这会加载完整的 SPA 应用
-   - 前端会调用 `GetMemoByShare` API 获取内容
-   - 附件通过带 `share_token` 的 URL 加载
+前端页面由 `frontend` 服务提供（`server/router/frontend/frontend.go`），**没有设置**：
+- `X-Frame-Options` 头部
+- `Content-Security-Policy: frame-ancestors` 指令
 
-2. **直接调用 API**（适合自定义 UI）：
-   ```javascript
-   // 从任意域名调用（受 gRPC-Gateway CORS 策略允许）
-   const response = await fetch('https://memos.example.com/api/v1/memos:byShare?shareId=xxx');
-   const memo = await response.json();
-   ```
+**这意味着**：
+- 分享页面**可以**被任意域名的 iframe 嵌入
+- 这是设计选择，因为分享功能就是为了让外部页面可以嵌入
+
+### 7.3 点击劫持（Clickjacking）风险分析
+
+**潜在风险**：
+```
+外部页面 (https://malicious.com)
+  ├─── 透明层（覆盖在 iframe 上方）
+  │         └─── "点击领取红包" 按钮（实际位置对应 iframe 内的某个操作）
+  │
+  └─── <iframe src="https://memos.example.com/memos/shares/TOKEN">
+                └─── 分享页面（只读展示）
+```
+
+**实际风险评估**：
+- 分享页面是**只读**的，没有敏感操作（如删除、修改、授权等）
+- 用户无法在分享页面执行危险操作
+- 因此**点击劫持风险较低**
+
+**如果未来分享页面添加了交互功能**：
+- 需要考虑添加 `X-Frame-Options: SAMEORIGIN` 或 `Content-Security-Policy: frame-ancestors 'self'`
+- 或允许用户配置是否允许 iframe 嵌入
 
 ---
 
-## 七、前端实现分析
+## 八、前端实现分析
 
-### 7.1 路由配置
+### 8.1 路由配置
 
 分享页面的路由定义（`web/src/router/index.tsx:94`）：
 
@@ -344,7 +449,7 @@ func setSecurityHeaders(c *echo.Context) {
 
 **注意**：该路由**不在** `RequireAuthRoute` 守卫下，访问时不需要登录。
 
-### 7.2 MemoDetail 页面的分享模式
+### 8.2 MemoDetail 页面的分享模式
 
 页面会自动检测是否为分享模式（`web/src/pages/MemoDetail.tsx:26-76`）：
 
@@ -370,7 +475,7 @@ const MemoDetail = () => {
 }
 ```
 
-### 7.3 分享模式下的错误处理
+### 8.3 分享模式下的错误处理
 
 如果 token 无效或过期，前端会重定向到 404（`web/src/pages/MemoDetail.tsx:62-67`）：
 
@@ -386,20 +491,23 @@ if (isShareMode) {
 
 ---
 
-## 八、权限控制架构总结
+## 九、权限控制架构总结（修正）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        外部页面 (iframe 嵌入)                     │
 │  <iframe src="https://memos.example.com/memos/shares/TOKEN">   │
+│  域名: https://external.com                                       │
 └────────────────────────────────────┬────────────────────────────┘
                                      │
+                                     │ iframe 加载
                                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Memos 前端 SPA (分享页面)                      │
+│  域名: https://memos.example.com                                  │
 │  路由: /memos/shares/:token                                      │
 │  - 无需登录                                                        │
-│  - 调用 GetMemoByShare API (公开)                                 │
+│  - 调用 Connect RPC API (同源请求，不受 CORS 限制)                │
 │  - 附件 URL 自动添加 share_token 参数                             │
 └────────────────────────────────────┬────────────────────────────┘
                                      │
@@ -407,12 +515,11 @@ if (isShareMode) {
               │                      │                      │
               ▼                      ▼                      ▼
 ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│   GetMemoByShare    │  │   附件访问 (/file/*) │  │   其他 API (如评论)  │
-│   /api/v1/memos:    │  │                     │  │                     │
-│   byShare           │  │                     │  │                     │
+│   Connect RPC       │  │   附件访问 (/file/*) │  │   其他 API (如评论)  │
+│   /memos.api.v1.*   │  │                     │  │                     │
 ├─────────────────────┤  ├─────────────────────┤  ├─────────────────────┤
-│ CORS: AllowOrigins  │  │ CORS: AllowOrigins  │  │ 需认证，受 Connect   │
-│: ["*"] (任意域名)    │  │: ["*"] (任意域名)    │  │ CORS 策略限制        │
+│ CORS: 严格          │  │ CORS: 宽松          │  │ CORS: 严格          │
+│ (同源或 InstanceURL) │  │ (AllowOrigins: ["*"]│  │ (同源或 InstanceURL) │
 ├─────────────────────┤  ├─────────────────────┤  └─────────────────────┘
 │ 权限校验:            │  │ 权限校验:            │
 │ 1. Token 存在性      │  │ 1. 若 memo 是公开   │
@@ -425,9 +532,9 @@ if (isShareMode) {
 
 ---
 
-## 九、安全特性与建议
+## 十、安全特性与建议
 
-### 9.1 已实现的安全特性
+### 10.1 已实现的安全特性
 
 | 特性 | 实现位置 | 说明 |
 |------|----------|------|
@@ -436,34 +543,39 @@ if (isShareMode) {
 | 信息泄露防护 | 统一返回 `NOT_FOUND` | 不区分"token 不存在"和"已过期" |
 | 归档 memo 不可访问 | `RowStatus == Archived` 检查 | 已删除的内容无法通过分享链接访问 |
 | 附件权限校验 | `checkAttachmentPermission` | 非公开 memo 的附件需要 token |
-| API 层 CORS | gRPC-Gateway 允许 `*` | 方便外部集成，但需注意 |
-| 文件防嵌入 | `X-Frame-Options: DENY` | 附件文件无法被 iframe 嵌入 |
+| 文件防嵌入 | `X-Frame-Options: DENY` | 附件文件无法被 iframe 直接嵌入 |
+| Connect CORS 严格 | `UnsafeAllowOriginFunc` | 保护需要认证的 API，防止 CSRF |
 
-### 9.2 潜在风险与建议
+### 10.2 潜在风险与建议
 
-#### 风险 1：分享链接可被猜测？
-- **现状**：使用 22 字符 shortuuid，熵值足够
-- **评估**：低风险，2^122 种组合，暴力破解不可行
+#### 风险 1：分享页面可被任意域名 iframe 嵌入
+- **现状**：前端页面没有设置 `X-Frame-Options` 或 CSP `frame-ancestors`
+- **评估**：低风险，因为分享页面是只读的
+- **建议**：
+  - 如果未来添加交互功能，考虑添加 `X-Frame-Options: SAMEORIGIN`
+  - 或允许用户在实例设置中配置允许的嵌入域名
 
-#### 风险 2：无撤销后立即失效机制？
-- **现状**：撤销是删除数据库记录，立即生效
-- **评估**：安全，删除后立即无法访问
+#### 风险 2：gRPC-Gateway CORS 过于宽松
+- **现状**：`/api/v1/*` 路径允许所有来源
+- **评估**：中等风险，但这是设计选择
+- **分析**：
+  - 公开 API（如 `GetMemoByShare`）本来就不需要认证
+  - 需要认证的 API 在服务层有额外校验
+  - 主要用于第三方集成（MCP、移动应用等）
+- **建议**：
+  - 保持现状，但需了解其影响
+  - 如果需要更严格的控制，可考虑添加 Referer 检查或自定义 CORS 策略
 
-#### 风险 3：CORS 策略过于宽松？
-- **现状**：gRPC-Gateway 允许所有来源调用 `GetMemoByShare`
-- **评估**：中等风险，需注意：
-  - 这是设计选择，方便外部集成
-  - 但恶意网站可以在用户不知情的情况下访问已知的分享 token
-  - 建议：如果需要更严格的控制，可考虑添加 Referer 检查或自定义 CORS 策略
-
-#### 风险 4：分享页面无 Clickjacking 防护？
-- **现状**：SPA 页面未设置 `X-Frame-Options` 或 CSP `frame-ancestors`
+#### 风险 3：分享链接无访问次数限制
+- **现状**：一个有效的 token 可以被无限次访问
 - **评估**：中等风险
-- **建议**：考虑在前端服务中添加安全头部，或允许用户配置是否允许 iframe 嵌入
+- **建议**：
+  - 可考虑添加访问次数限制（可选功能）
+  - 或添加访问日志以便追踪滥用
 
 ---
 
-## 十、关键代码文件索引
+## 十一、关键代码文件索引
 
 | 功能 | 文件路径 | 关键行号 |
 |------|----------|----------|
@@ -472,30 +584,52 @@ if (isShareMode) {
 | GetMemoByShare 实现 | `server/router/api/v1/memo_share_service.go` | 151-192 |
 | Token 校验逻辑 | `server/router/api/v1/memo_share_service.go` | 199-208 |
 | 附件权限校验 | `server/router/fileserver/fileserver.go` | 636-688 |
-| API 层 CORS 配置 | `server/router/api/v1/v1.go` | 130-165 |
+| Connect CORS 配置 | `server/router/api/v1/v1.go` | 153-163 |
+| gRPC-Gateway CORS 配置 | `server/router/api/v1/v1.go` | 130-132 |
 | 文件服务器安全头部 | `server/router/fileserver/fileserver.go` | 742-747 |
 | 前端分享路由 | `web/src/router/index.tsx` | 94 |
 | 前端分享模式检测 | `web/src/pages/MemoDetail.tsx` | 26-76 |
 | 附件 URL 重写 | `web/src/hooks/useMemoShareQueries.ts` | 96-100 |
 | 分享链接生成 | `web/src/hooks/useMemoShareQueries.ts` | 82-84 |
+| 前端 Connect 配置 | `web/src/connect.ts` | 184-189 |
 
 ---
 
-## 十一、总结
+## 十二、总结
 
-Memos 的 iframe 嵌入机制基于 **分享链接 (MemoShare)** 设计，核心特点：
+### 12.1 核心修正
 
-1. **Token 驱动**：每个分享链接使用高熵的 shortuuid 作为 token
-2. **按需过期**：支持设置过期时间，临时分享更安全
-3. **权限隔离**：
-   - 分享链接仅授予对特定 memo 的只读访问
-   - 附件访问需要额外的 token 校验
-   - 已归档或删除的内容无法访问
-4. **跨域友好**：
-   - gRPC-Gateway 层允许任意域名调用 API
-   - 前端 SPA 页面可被 iframe 嵌入
-5. **信息安全**：
-   - 无效/过期 token 统一返回 404，防止信息泄露
-   - 附件文件设置 `X-Frame-Options: DENY` 防止被直接嵌入
+我之前的分析存在以下关键错误，现已修正：
 
-这种设计平衡了**易用性**（方便外部嵌入和集成）和**安全性**（细粒度的权限控制、高熵 token、过期机制）。
+| 错误点 | 修正后 |
+|--------|--------|
+| iframe 内的请求是跨域请求 | iframe 内的请求是**同源请求**，因为页面运行在 memos 域名上下文中 |
+| 前端使用 gRPC-Gateway API | 前端使用 **Connect RPC** 格式的 API（`/memos.api.v1.*`） |
+| CORS 配置与 iframe 嵌入相关 | CORS 配置主要用于**第三方集成**，iframe 嵌入场景不涉及 |
+| 所有 API 路径 CORS 相同 | 有**两套独立**的 API 接口，CORS 策略不同 |
+
+### 12.2 Iframe 嵌入的实际机制
+
+当外部页面通过 iframe 嵌入 Memos 分享页面时：
+
+1. **页面加载**：iframe 从 `https://memos.example.com` 加载分享页面
+2. **API 调用**：页面内的 JavaScript 发起**同源请求**到 Connect RPC 接口
+3. **Token 校验**：服务端通过 `GetMemoByShare` 校验 token 的有效性和过期状态
+4. **附件访问**：附件 URL 携带 `share_token` 参数，服务端进行额外权限校验
+5. **CORS 不参与**：整个过程是同源请求，CORS 配置不生效
+
+### 12.3 权限控制的核心边界
+
+服务端的权限控制与是否跨域**无关**，核心是：
+
+1. **Token 校验**：检查 token 是否存在、未过期
+2. **Memo 状态**：检查 memo 是否存在、未归档
+3. **附件权限**：检查是否有有效的 share_token
+4. **可见性规则**：根据 memo 的 visibility 字段决定访问权限
+
+### 12.4 设计优点
+
+- **简单可靠**：基于 token 的分享机制，无需复杂的跨域处理
+- **细粒度控制**：每个分享链接只授予特定 memo 的只读访问
+- **安全性**：高熵 token、过期机制、信息泄露防护
+- **灵活性**：gRPC-Gateway 允许第三方集成，Connect RPC 保护浏览器客户端
