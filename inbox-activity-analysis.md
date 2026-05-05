@@ -1495,4 +1495,484 @@ function MemoMentionMessage({ notification }: Props) {
        │                        │                      │<────────────────────│
        │                        │                      │                    │
        │                        │                      │ 5. 通知更新          │                    │
-       │                        │                      │────────────────────>
+       │                        │                      │────────────────────>│
+       │                        │                      │                    │ 重新渲染
+       │                        │                      │                    │ 未读计数更新
+```
+
+---
+
+## 11. 关键数据结构映射关系
+
+### 11.1 后端到前端的转换
+
+| 后端 (Go) | 前端 (TypeScript) | 说明 |
+|-----------|-------------------|------|
+| `store.Inbox` | `UserNotification` | 通过 API 层转换 |
+| `storepb.InboxMessage_MEMO_COMMENT` | `UserNotification_Type.MEMO_COMMENT` | 评论通知类型 |
+| `storepb.InboxMessage_MEMO_MENTION` | `UserNotification_Type.MEMO_MENTION` | 提及通知类型 |
+| `store.UNREAD` | `UserNotification_Status.UNREAD` | 未读状态 |
+| `store.ARCHIVED` | `UserNotification_Status.ARCHIVED` | 已归档状态 |
+
+### 11.2 事件与通知的对应关系
+
+| 事件类型 | 是否生成 Inbox | 是否触发 SSE | 是否触发 Webhook | 是否生成活动统计 |
+|----------|----------------|--------------|------------------|------------------|
+| 备忘录创建 | ❌ 否 | ✅ 是 | ✅ 是 | ✅ 是 |
+| 备忘录更新 | ❌ 否 | ✅ 是 | ✅ 是 | ✅ 是 |
+| 备忘录删除 | ❌ 否 | ✅ 是 | ✅ 是 | ✅ 是 |
+| 评论创建 | ✅ 是 (通知原作者) | ✅ 是 | ✅ 是 | ✅ 是 |
+| 用户被提及 | ✅ 是 (通知被提及者) | ❌ 否 | ❌ 否 | ❌ 否 |
+| 反应添加/删除 | ❌ 否 | ✅ 是 | ❌ 否 | ❌ 否 |
+
+---
+
+## 12. 架构总结
+
+### 12.1 系统设计亮点
+
+1. **多通道通知**: Inbox 消息 + 邮件 + SSE + Webhook，满足不同场景需求
+2. **尽力而为模式**: 邮件和 Webhook 采用异步发送，失败不影响主流程
+3. **权限控制**: SSE 广播时根据备忘录可见性过滤接收者
+4. **智能去重**: 评论场景中避免重复发送通知（原作者已收到评论通知，不再发送提及通知）
+5. **前端缓存优化**: React Query + SSE 实现高效的实时更新
+6. **数据迁移平滑**: 从 activity 表到 inbox 表的迁移采用分步策略，确保数据完整性
+
+### 12.2 潜在改进点
+
+1. **SSE 事件与 Inbox 的联动**
+   - 目前 `memo.comment.created` 事件不会触发通知列表刷新
+   - 建议：当收到评论或提及相关的 SSE 事件时，主动使 `userKeys.notifications()` 缓存失效
+
+2. **通知类型扩展**
+   - 目前只支持 `MEMO_COMMENT` 和 `MEMO_MENTION`
+   - 可考虑扩展：`REACTION_CREATED`（有人点赞/反应）、`MEMO_SHARED`（备忘录被共享）等
+
+3. **批量操作支持**
+   - 前端目前只能单条标记已读/删除
+   - 可考虑添加"全部标记已读"功能
+
+---
+
+## 13. 相关文件索引
+
+### 后端
+
+| 文件路径 | 职责 |
+|----------|------|
+| `store/inbox.go` | Inbox 数据结构定义 |
+| `store/db/sqlite/inbox.go` | SQLite 存储实现 |
+| `proto/store/inbox.proto` | Protobuf 定义 |
+| `store/migration/sqlite/0.10/00__activity.sql` | 旧版 activity 表创建 |
+| `store/migration/sqlite/0.17/01__delete_activities.sql` | 清空 activity 表数据 |
+| `store/migration/sqlite/0.27/02__migrate_inbox_message_payload.sql` | 迁移 inbox 载荷 |
+| `store/migration/sqlite/0.27/03__drop_activity.sql` | 删除 activity 表 |
+| `server/router/api/v1/memo_service.go` | 评论创建、事件广播 |
+| `server/router/api/v1/memo_mention_helpers.go` | 提及解析与通知分发 |
+| `server/router/api/v1/notification_email.go` | Inbox + 邮件通知入口 |
+| `server/notification/email.go` | 邮件通知构建与发送 |
+| `server/router/api/v1/sse_hub.go` | SSE 连接管理与广播 |
+| `server/router/api/v1/sse_handler.go` | SSE HTTP 处理器 |
+| `server/router/api/v1/user_service.go` | ListUserNotifications 实现 |
+| `server/router/api/v1/user_service_stats.go` | GetUserStats 统计实现 |
+| `internal/webhook/webhook.go` | Webhook 异步发送 |
+
+### 前端
+
+| 文件路径 | 职责 |
+|----------|------|
+| `web/src/hooks/useLiveMemoRefresh.ts` | SSE 连接管理与事件处理 |
+| `web/src/hooks/useUserQueries.ts` | 通知数据获取 Hook |
+| `web/src/hooks/useFilteredMemoStats.ts` | 活动统计数据处理 |
+| `web/src/pages/Inboxes.tsx` | Inbox 页面主组件 |
+| `web/src/components/Navigation.tsx` | 导航栏通知入口 |
+| `web/src/components/Inbox/MemoMentionMessage.tsx` | 提及通知组件 |
+| `web/src/components/Inbox/MemoCommentMessage.tsx` | 评论通知组件 |
+| `web/src/components/StatisticsView/StatisticsView.tsx` | 统计视图组件 |
+| `web/src/components/ActivityCalendar/CalendarCell.tsx` | 热力图日历单元格 |
+
+---
+
+## 14. 通知状态更新后的一致性闭环分析
+
+### 14.1 当前实现的状态更新流程
+
+#### 问题核心：直接调用 API，不使用 React Query 缓存机制
+
+**前端通知组件的更新逻辑** (`web/src/components/Inbox/MemoMentionMessage.tsx`):
+
+```typescript
+const handleArchiveMessage = async (silence = false) => {
+  // 直接调用 Connect RPC 客户端，不经过 React Query
+  await userServiceClient.updateUserNotification({
+    notification: {
+      name: notification.name,
+      status: UserNotification_Status.ARCHIVED,
+    },
+    updateMask: create(FieldMaskSchema, { paths: ["status"] }),
+  });
+  if (!silence) {
+    toast.success(t("message.archived-successfully"));
+  }
+};
+
+const handleDeleteMessage = async () => {
+  // 直接调用 Connect RPC 客户端，不经过 React Query
+  await userServiceClient.deleteUserNotification({
+    name: notification.name,
+  });
+  toast.success(t("message.deleted-successfully"));
+};
+```
+
+**关键配置** (`web/src/hooks/useUserQueries.ts`):
+
+```typescript
+export function useNotifications() {
+  return useQuery({
+    queryKey: userKeys.notifications(),
+    queryFn: async () => {
+      if (!currentUser?.name) {
+        return [];
+      }
+      const { notifications } = await userServiceClient.listUserNotifications({ 
+        parent: currentUser.name 
+      });
+      return notifications;
+    },
+    enabled: !!currentUser?.name,
+    staleTime: 1000 * 30, // 30 秒缓存有效期
+  });
+}
+```
+
+**Query Client 配置** (`web/src/lib/query-client.ts`):
+
+```typescript
+defaultOptions: {
+  queries: {
+    staleTime: 1000 * 30,        // 30 秒后数据变陈旧
+    gcTime: 1000 * 60 * 5,       // 5 分钟后清理缓存
+    refetchOnWindowFocus: true,   // 窗口获得焦点时重新获取
+    refetchOnReconnect: true,     // 网络重连时重新获取
+  },
+}
+```
+
+---
+
+### 14.2 状态变更一致性时序图
+
+#### 14.2.1 当前实现的问题流程
+
+```
+┌──────────┐       ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+│  用户操作  │       │  通知组件     │       │  React Query │       │   服务端      │
+│ (UI 层)  │       │ (业务逻辑)   │       │   (缓存层)   │       │  (数据层)    │
+└────┬─────┘       └──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+     │                     │                       │                       │
+     │  1. 点击"已读"按钮  │                       │                       │
+     │────────────────────>│                       │                       │
+     │                     │                       │                       │
+     │                     │  2. 直接调用 API      │                       │
+     │                     │  updateUserNotification │                     │
+     │                     │──────────────────────────────────────────────>│
+     │                     │                       │                       │
+     │                     │                       │                       │  3. 服务端更新
+     │                     │                       │                       │  inbox.status
+     │                     │                       │                       │  UNREAD → ARCHIVED
+     │                     │                       │                       │
+     │                     │<──────────────────────────────────────────────│
+     │                     │  4. 返回更新成功      │                       │
+     │                     │                       │                       │
+     │                     │  5. 显示 toast        │                       │
+     │<────────────────────│  "已归档成功"         │                       │
+     │                     │                       │                       │
+     │  ⚠️ 不一致开始      │                       │                       │
+     │  ─────────────      │                       │                       │
+     │                     │                       │  6. 缓存未更新！      │
+     │                     │                       │  notifications[]     │
+     │                     │                       │  仍包含状态为 UNREAD  │
+     │                     │                       │  的旧数据              │
+     │                     │                       │                       │
+     │  7. 导航角标仍显示  │                       │                       │
+     │     旧的未读数量    │                       │                       │
+     │  ─────────────────  │                       │                       │
+     │                     │                       │                       │
+     │  ⏳ 等待 staleTime  │                       │                       │
+     │     30 秒过期       │                       │                       │
+     │  ─────────────────  │                       │                       │
+     │                     │                       │                       │
+     │  8. 数据变陈旧      │                       │                       │
+     │                     │                       │  9. 下次查询时重取   │
+     │                     │                       │  listUserNotifications │
+     │                     │                       │<──────────────────────│
+     │                     │                       │                       │
+     │  10. 一致性恢复     │                       │                       │
+     │  ───────────────    │                       │                       │
+```
+
+#### 14.2.2 理想实现的正确流程（对比参考）
+
+```
+┌──────────┐       ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+│  用户操作  │       │  通知组件     │       │  React Query │       │   服务端      │
+│ (UI 层)  │       │ (业务逻辑)   │       │   (缓存层)   │       │  (数据层)    │
+└────┬─────┘       └──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+     │                     │                       │                       │
+     │  1. 点击"已读"按钮  │                       │                       │
+     │────────────────────>│                       │                       │
+     │                     │                       │                       │
+     │                     │  2. 使用 useMutation  │                       │
+     │                     │  触发 mutation        │                       │
+     │                     │──────────────────────>│                       │
+     │                     │                       │                       │
+     │                     │                       │  3. 调用 API          │
+     │                     │                       │  updateUserNotification │
+     │                     │                       │──────────────────────>│
+     │                     │                       │                       │
+     │                     │                       │                       │  4. 服务端更新
+     │                     │                       │                       │
+     │                     │                       │<──────────────────────│
+     │                     │                       │  5. 返回更新成功      │
+     │                     │                       │                       │
+     │                     │                       │  6. onSuccess 回调    │
+     │                     │                       │  invalidateQueries()  │
+     │                     │                       │  ─────────────────    │
+     │                     │                       │  或                   │
+     │                     │                       │  setQueryData()       │
+     │                     │                       │  ─────────────────    │
+     │                     │                       │                       │
+     │                     │                       │  7. 立即重取 / 更新   │
+     │                     │                       │  listUserNotifications │
+     │                     │                       │<──────────────────────│
+     │                     │                       │                       │
+     │  8. UI 立即更新     │                       │                       │
+     │  ───────────────    │                       │                       │
+     │  ✅ 无短暂不一致    │                       │                       │
+```
+
+---
+
+### 14.3 不一致场景风险清单
+
+#### 14.3.1 场景一：点击"已读"按钮
+
+| 维度 | 详情 |
+|------|------|
+| **触发条件** | 用户在 Inbox 页面点击某条通知的"已读"（归档）按钮 |
+| **代码路径** | `web/src/components/Inbox/MemoMentionMessage.tsx:22-33` |
+| **用户可见现象** | 1. Toast 显示"已归档成功"<br>2. 导航栏角标仍显示旧的未读数量<br>3. 通知卡片仍显示为"未读"状态（左侧蓝条、高亮背景） |
+| **不一致持续时间** | 最长 30 秒（`staleTime` 配置） |
+| **自动恢复路径** | 1. 等待 30 秒 `staleTime` 过期<br>2. 用户切换到其他标签页再切回（`refetchOnWindowFocus`）<br>3. 网络断开重连（`refetchOnReconnect`）<br>4. 用户手动刷新页面 |
+| **影响程度** | 中 - 用户操作后反馈不及时，可能产生困惑 |
+
+#### 14.3.2 场景二：点击通知卡片跳转
+
+| 维度 | 详情 |
+|------|------|
+| **触发条件** | 用户点击通知卡片跳转到对应备忘录，自动触发"已读"标记 |
+| **代码路径** | `web/src/components/Inbox/MemoMentionMessage.tsx:68-73` |
+| **用户可见现象** | 1. 成功跳转到目标备忘录<br>2. 若用户返回 Inbox 页面，通知仍显示为"未读"<br>3. 导航栏角标仍显示旧的未读数量 |
+| **不一致持续时间** | 最长 30 秒 |
+| **自动恢复路径** | 同上 |
+| **影响程度** | 中 - 用户可能认为点击后应该已读，但实际未生效 |
+
+#### 14.3.3 场景三：点击"删除"按钮
+
+| 维度 | 详情 |
+|------|------|
+| **触发条件** | 用户在 Inbox 页面点击某条已归档通知的"删除"按钮 |
+| **代码路径** | `web/src/components/Inbox/MemoMentionMessage.tsx:35-40` |
+| **用户可见现象** | 1. Toast 显示"删除成功"<br>2. 通知卡片仍然存在于列表中<br>3. 总数统计（已归档数量）未减少 |
+| **不一致持续时间** | 最长 30 秒 |
+| **自动恢复路径** | 同上 |
+| **影响程度** | 高 - 用户明确执行删除操作，但 UI 没有相应变化，体验很差 |
+
+#### 14.3.4 不一致原因总结
+
+| 原因 | 说明 |
+|------|------|
+| **未使用 React Query Mutation** | 直接调用 `userServiceClient.updateUserNotification()`，不经过 React Query 的 mutation 机制 |
+| **未使缓存失效** | 没有调用 `queryClient.invalidateQueries({ queryKey: userKeys.notifications() })` |
+| **未更新本地缓存** | 没有调用 `queryClient.setQueryData()` 主动更新缓存 |
+| **依赖自动过期** | 完全依赖 `staleTime: 30s` 的自动过期机制 |
+| **无乐观更新** | 没有实现乐观 UI 更新（在 API 调用成功前就更新 UI） |
+
+---
+
+### 14.4 不改代码前提下的最小验证步骤
+
+#### 14.4.1 验证环境准备
+
+```bash
+# 1. 启动后端服务
+cd h:\fz\solo-dogfeeding\code\130-memos
+go run ./cmd/memos --port 8081
+
+# 2. 启动前端开发服务器
+cd web
+pnpm dev
+```
+
+#### 14.4.2 验证步骤一：未读角标不一致
+
+**目标**：验证点击"已读"后导航角标不会立即更新
+
+| 步骤 | 操作 | 预期（正确行为） | 实际（当前行为） |
+|------|------|------------------|------------------|
+| 1 | 使用两个用户账号，A 创建备忘录，B 评论 A 的备忘录 | - | - |
+| 2 | 以用户 A 登录，查看导航栏通知角标 | 显示数字 1 | 显示数字 1 |
+| 3 | 进入 Inbox 页面，确认有 1 条未读通知 | 显示 1 条未读 | 显示 1 条未读 |
+| 4 | 点击通知卡片上的"已读"（归档）按钮 | Toast 显示成功<br>**角标立即变为 0**<br>**通知状态变为已归档** | Toast 显示成功<br>**角标仍显示 1** ⚠️<br>**通知仍显示未读** ⚠️ |
+| 5 | 等待 30 秒 | - | - |
+| 6 | 刷新页面或切出标签页再切回 | - | 角标变为 0，通知状态更新 |
+
+#### 14.4.3 验证步骤二：删除操作不一致
+
+**目标**：验证点击"删除"后通知不会立即从列表消失
+
+| 步骤 | 操作 | 预期（正确行为） | 实际（当前行为） |
+|------|------|------------------|------------------|
+| 1 | 确保有已归档的通知（或先执行验证步骤一） | - | - |
+| 2 | 切换到"已归档"标签页，点击通知的"删除"按钮 | Toast 显示删除成功<br>**通知立即从列表消失**<br>**已归档计数减 1** | Toast 显示删除成功<br>**通知仍在列表中** ⚠️<br>**计数未变化** ⚠️ |
+| 3 | 等待 30 秒或刷新页面 | - | 通知消失，计数更新 |
+
+#### 14.4.4 验证步骤三：staleTime 依赖验证
+
+**目标**：验证一致性恢复完全依赖 `staleTime` 过期
+
+**操作**：
+1. 打开浏览器开发者工具（F12）
+2. 切换到 Network 标签
+3. 执行"已读"操作
+4. 观察 Network 请求
+
+**观察要点**：
+| 时间点 | 事件 |
+|--------|------|
+| T=0 | 点击"已读"，发送 `UpdateUserNotification` 请求 |
+| T=0.1s | 服务端返回成功，UI 显示 toast |
+| T=0.2s | **无** `ListUserNotifications` 请求 ⚠️ |
+| ... | 等待期间无自动请求 |
+| T=30s+ | 数据变陈旧（stale），下次触发查询时才会重取 |
+
+#### 14.4.5 快速验证（手动刷新对比）
+
+| 操作 | 不刷新（30秒内） | 刷新后 |
+|------|------------------|--------|
+| 点击"已读"后 | 角标仍显示旧值 | 角标显示正确值 |
+| 点击"删除"后 | 通知仍在列表中 | 通知已消失 |
+| 点击通知跳转后 | 返回 Inbox 仍显示未读 | 返回 Inbox 显示已归档 |
+
+---
+
+### 14.5 理想的实现方式（修复建议）
+
+#### 14.5.1 使用 React Query Mutation 封装
+
+**新增 Hook** (`web/src/hooks/useUserQueries.ts`):
+
+```typescript
+export function useArchiveNotification() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (notificationName: string) => {
+      await userServiceClient.updateUserNotification({
+        notification: {
+          name: notificationName,
+          status: UserNotification_Status.ARCHIVED,
+        },
+        updateMask: create(FieldMaskSchema, { paths: ["status"] }),
+      });
+    },
+    onSuccess: () => {
+      // 方式一：使缓存失效，触发重取
+      queryClient.invalidateQueries({ queryKey: userKeys.notifications() });
+      
+      // 方式二：或直接更新缓存（更高效）
+      // queryClient.setQueryData(userKeys.notifications(), (oldData: UserNotification[] | undefined) => {
+      //   if (!oldData) return oldData;
+      //   return oldData.map(n => 
+      //     n.name === notificationName 
+      //       ? { ...n, status: UserNotification_Status.ARCHIVED } 
+      //       : n
+      //   );
+      // });
+    },
+  });
+}
+
+export function useDeleteNotification() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (notificationName: string) => {
+      await userServiceClient.deleteUserNotification({ name: notificationName });
+    },
+    onSuccess: (_data, notificationName) => {
+      queryClient.setQueryData(userKeys.notifications(), (oldData: UserNotification[] | undefined) => {
+        if (!oldData) return oldData;
+        return oldData.filter(n => n.name !== notificationName);
+      });
+    },
+  });
+}
+```
+
+#### 14.5.2 组件中使用
+
+**修改通知组件** (`web/src/components/Inbox/MemoMentionMessage.tsx`):
+
+```typescript
+function MemoMentionMessage({ notification }: Props) {
+  const archiveMutation = useArchiveNotification();
+  const deleteMutation = useDeleteNotification();
+
+  const handleArchiveMessage = async (silence = false) => {
+    await archiveMutation.mutateAsync(notification.name);
+    if (!silence) {
+      toast.success(t("message.archived-successfully"));
+    }
+  };
+
+  const handleDeleteMessage = async () => {
+    await deleteMutation.mutateAsync(notification.name);
+    toast.success(t("message.deleted-successfully"));
+  };
+  
+  // ... 其余代码
+}
+```
+
+#### 14.5.3 修复后的一致性保证
+
+| 保证机制 | 说明 |
+|----------|------|
+| **立即失效** | 操作成功后立即 `invalidateQueries`，触发重取 |
+| **乐观更新** | 使用 `setQueryData` 可在 API 调用前/后立即更新 UI |
+| **无延迟** | 不再依赖 30 秒的 `staleTime` |
+| **用户反馈** | Toast + UI 即时变化，操作反馈明确 |
+
+---
+
+## 15. 附录：一致性问题速查表
+
+### 15.1 问题诊断表
+
+| 问题现象 | 可能原因 | 验证方法 |
+|----------|----------|----------|
+| 操作后 UI 未更新 | 缓存未失效 | 检查是否调用 `invalidateQueries` |
+| 角标延迟更新 | 依赖 staleTime | 等待 30 秒后观察是否恢复 |
+| 删除后仍显示 | 未从缓存移除 | 检查是否使用 `setQueryData` 或 `invalidateQueries` |
+| 刷新后才正常 | 完全依赖缓存 | 对比刷新前后的数据 |
+
+### 15.2 关键配置项影响
+
+| 配置项 | 当前值 | 影响 |
+|--------|--------|------|
+| `staleTime` | 30s | 数据在 30 秒内被认为是新鲜的，不会自动重取 |
+| `refetchOnWindowFocus` | true | 切出再切回标签页会触发重取 |
+| `refetchOnReconnect` | true | 网络重连会触发重取 |
+| `gcTime` | 5min | 缓存数据在内存中保留 5 分钟 |
