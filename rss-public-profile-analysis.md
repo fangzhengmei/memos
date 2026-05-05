@@ -706,12 +706,12 @@ if memo.RowStatus == store.Archived {
 | 未登录调用 `ListMemos` | 只返回 PUBLIC memo | ✓ |
 | 未登录调用 `GetMemo` (PUBLIC) | 返回 memo | ✓ |
 | 未登录调用 `GetMemo` (PROTECTED) | Unauthenticated | ✓ |
-| 未登录调用 `GetMemo` (PRIVATE) | PermissionDenied | ✓ |
+| 未登录调用 `GetMemo` (PRIVATE) | **Unauthenticated** ⚠️ | 原结论错误，应与代码一致 |
 | 已登录用户 A 调用 `GetMemo` (用户 B 的 PROTECTED) | 返回 memo | ✓ |
 | 已登录用户 A 调用 `GetMemo` (用户 B 的 PRIVATE) | PermissionDenied | ✓ |
 | 未登录调用 `GetUser` | 返回用户信息，但 email 为空 | ✓ |
 
-### 9.2 关键测试代码位置
+### 9.3 关键测试代码位置
 
 - `store/test/memo_test.go` - memo 基础测试
 - `store/test/memo_filter_test.go` - 过滤器测试
