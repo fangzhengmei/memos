@@ -32,30 +32,20 @@ Memos 使用了两层设置系统：
 
 ## 二、注册入口控制
 
-### 2.1 双层控制机制
+### 2.1 两种注册路径对比
 
-#### 服务端强制验证（`server/router/api/v1/user_service.go:195-207`）
+Memos 支持两种创建用户账户的方式：
 
-```go
-// 关键代码位置：server/router/api/v1/user_service.go:195-207
-if roleToAssign != store.RoleAdmin {
-    instanceGeneralSetting, err := s.Store.GetInstanceGeneralSetting(ctx)
-    if instanceGeneralSetting.DisallowUserRegistration {
-        return nil, status.Errorf(codes.PermissionDenied, "user registration is not allowed")
-    }
-    if instanceGeneralSetting.DisallowPasswordAuth {
-        return nil, status.Errorf(codes.PermissionDenied, "password signup is not allowed")
-    }
-}
-```
+| 路径 | 触发方式 | 创建用户方式 | 用户名来源 |
+|-----|---------|-------------|-----------|
+| **密码注册** | 用户主动访问 `/auth/signup` | `CreateUser` API | 用户手动输入 |
+| **SSO 首次登录** | 用户通过 OAuth2 登录 | `resolveSSOUser` 内部创建 | 自动生成 UUID 格式 |
 
-**验证逻辑：**
-1. 第一个用户创建为 Admin，不受限制
-2. 普通用户注册时必须检查：
-   - `DisallowUserRegistration`: 是否允许用户注册
-   - `DisallowPasswordAuth`: 是否允许密码注册
+---
 
-#### 前端隐藏控制（`web/src/pages/SignUp.tsx:33, 97-145`）
+### 2.2 密码注册路径完整分析
+
+#### 2.2.1 前端入口控制（`web/src/pages/SignUp.tsx`）
 
 ```typescript
 // 关键代码位置：web/src/pages/SignUp.tsx:33
@@ -71,17 +61,189 @@ const canUsePasswordSignUp = !instanceGeneralSetting.disallowUserRegistration &&
 )}
 ```
 
-### 2.2 双层边界分析
+**前端显示条件：**
+- `disallowUserRegistration = false`（允许用户注册）
+- `disallowPasswordAuth = false`（允许密码认证）
 
-**第一层：服务端强制（安全边界）**
-- 即使前端绕过，服务端 API 也会拒绝
-- 返回 gRPC 错误码 `PermissionDenied`
-- 适用于所有 API 调用（包括直接 API 访问）
+#### 2.2.2 服务端强制验证（`server/router/api/v1/user_service.go:145-238`）
 
-**第二层：前端隐藏（用户体验边界）**
-- 根据设置动态显示/隐藏注册入口
-- 提供友好的提示信息
-- 减少无效请求
+```go
+// CreateUser API 中的验证逻辑
+// 关键代码位置：server/router/api/v1/user_service.go:195-207
+if roleToAssign != store.RoleAdmin {
+    instanceGeneralSetting, err := s.Store.GetInstanceGeneralSetting(ctx)
+    if instanceGeneralSetting.DisallowUserRegistration {
+        return nil, status.Errorf(codes.PermissionDenied, "user registration is not allowed")
+    }
+    if instanceGeneralSetting.DisallowPasswordAuth {
+        return nil, status.Errorf(codes.PermissionDenied, "password signup is not allowed")
+    }
+}
+```
+
+**服务端验证条件：**
+- 第一个用户创建为 Admin，**不受限制**
+- 普通用户注册时必须同时满足：
+  - `DisallowUserRegistration = false`
+  - `DisallowPasswordAuth = false`
+
+#### 2.2.3 密码注册受约束的全局开关
+
+| 开关名称 | 类型 | 作用 | 密码注册时的影响 |
+|---------|------|------|----------------|
+| `DisallowUserRegistration` | 实例设置 | 是否允许用户注册 | 为 `true` 时完全禁止创建非 Admin 用户 |
+| `DisallowPasswordAuth` | 实例设置 | 是否允许密码认证 | 为 `true` 时禁止使用密码注册和登录 |
+
+---
+
+### 2.3 SSO 首次登录创建账号路径完整分析
+
+#### 2.3.1 前端登录入口（`web/src/pages/SignIn.tsx`）
+
+```typescript
+// 关键代码位置：web/src/pages/SignIn.tsx:27-33
+useEffect(() => {
+  const fetchIdentityProviderList = async () => {
+    const { identityProviders } = await identityProviderServiceClient.listIdentityProviders({});
+    setIdentityProviderList(identityProviders);
+  };
+  fetchIdentityProviderList();
+}, []);
+
+// 关键代码位置：web/src/pages/SignIn.tsx:80-92
+{!instanceGeneralSetting.disallowPasswordAuth ? (
+  <PasswordSignInForm redirectPath={redirectTarget} />
+) : (
+  identityProviderList.length === 0 && <p className="w-full text-2xl mt-2 text-muted-foreground">Password auth is not allowed.</p>
+)}
+
+// 关键代码位置：web/src/pages/SignIn.tsx:85-92
+{!instanceGeneralSetting.disallowUserRegistration && !instanceGeneralSetting.disallowPasswordAuth && (
+  <p className="w-full mt-4 text-sm">
+    <span className="text-muted-foreground">{t("auth.sign-up-tip")}</span>
+    <Link to={signUpPath} className="cursor-pointer ml-2 text-primary hover:underline" viewTransition>
+      {t("common.sign-up")}
+    </Link>
+  </p>
+)}
+```
+
+**前端显示特点：**
+- SSO 登录按钮始终显示（只要配置了 IDP）
+- 密码登录表单受 `disallowPasswordAuth` 控制
+- 注册链接受 `disallowUserRegistration` 和 `disallowPasswordAuth` 双重控制
+
+#### 2.3.2 服务端 SSO 处理流程（`server/router/api/v1/auth_service.go`）
+
+整个流程分为两步：
+
+**第一步：身份验证（`auth_service.go:91-101`）**
+```go
+} else if ssoCredentials := request.GetSsoCredentials(); ssoCredentials != nil {
+    // 1. 解析 OAuth2 回调，获取用户信息
+    identityProvider, userInfo, err := s.resolveSSOIdentity(ctx, ssoCredentials.IdpName, ssoCredentials.Code, ssoCredentials.RedirectUri, ssoCredentials.CodeVerifier)
+    if err != nil {
+        return nil, err
+    }
+    // 2. 查找或创建本地用户
+    user, err := s.resolveSSOUser(ctx, nil, identityProvider, userInfo)
+    if err != nil {
+        return nil, err
+    }
+    existingUser = user
+}
+```
+
+**第二步：首次登录创建用户（`auth_service.go:134-217`）**
+
+```go
+func (s *APIV1Service) resolveSSOUser(ctx context.Context, currentUser *store.User, identityProvider *storepb.IdentityProvider, userInfo *idp.IdentityProviderUserInfo) (*store.User, error) {
+    // 1. 检查是否已有本地用户与该 SSO 账号关联
+    user, err := s.getLinkedSSOUser(ctx, provider, externUID)
+    if err != nil {
+        return nil, err
+    }
+    if user != nil {
+        // 已存在关联，直接返回
+        return user, nil
+    }
+
+    // 2. 首次登录：强制检查注册开关
+    instanceGeneralSetting, err := s.Store.GetInstanceGeneralSetting(ctx)
+    if err != nil {
+        return nil, status.Errorf(codes.Internal, "failed to get instance general setting, error: %v", err)
+    }
+    if instanceGeneralSetting.DisallowUserRegistration {
+        return nil, status.Errorf(codes.PermissionDenied, "user registration is not allowed")
+    }
+
+    // 3. 自动创建本地用户
+    password, err := util.RandomString(20)  // 生成随机密码
+    passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    username, err := deriveSSOUsername()    // 生成 UUID 格式用户名
+    user, err = s.Store.CreateUser(ctx, &store.User{
+        Username:     username,             // UUID，如 "a1b2c3d4"
+        Role:         store.RoleUser,
+        Nickname:     userInfo.DisplayName, // 来自 SSO
+        Email:        userInfo.Email,       // 来自 SSO
+        AvatarURL:    userInfo.AvatarURL,   // 来自 SSO
+        PasswordHash: string(passwordHash), // 随机密码，用户不知道
+    })
+
+    // 4. 创建用户身份关联记录
+    if _, err := s.Store.CreateUserIdentity(ctx, &store.UserIdentity{
+        UserID:    user.ID,
+        Provider:  provider,
+        ExternUID: externUID,
+    }); err != nil {
+        // 并发处理：如果另一个请求先创建了，加载获胜的用户
+        // ...
+    }
+    return user, nil
+}
+```
+
+#### 2.3.3 SSO 首次登录受约束的全局开关
+
+| 开关名称 | 类型 | 作用 | SSO 首次登录时的影响 |
+|---------|------|------|---------------------|
+| `DisallowUserRegistration` | 实例设置 | 是否允许用户注册 | **为 `true` 时禁止** |
+| `DisallowPasswordAuth` | 实例设置 | 是否允许密码认证 | **不影响** |
+
+**关键点：**
+- SSO 首次登录**不受 `DisallowPasswordAuth` 影响**
+- SSO 首次登录**受 `DisallowUserRegistration` 影响**
+- SSO 创建的用户有随机密码，但用户无法通过密码登录（除非后来启用了密码认证且用户设置了密码）
+
+#### 2.3.4 密码登录的额外限制（`auth_service.go:87-89`）
+
+```go
+// 关键代码位置：server/router/api/v1/auth_service.go:87-89
+if instanceGeneralSetting.DisallowPasswordAuth && user.Role == store.RoleUser {
+    return nil, status.Errorf(codes.PermissionDenied, "password signin is not allowed")
+}
+```
+
+**注意：**
+- 密码登录时，**Admin 用户不受 `DisallowPasswordAuth` 限制**
+- 只有普通用户（`RoleUser`）被禁止使用密码登录
+
+---
+
+### 2.4 两种路径对比总结
+
+| 维度 | 密码注册 | SSO 首次登录创建 |
+|-----|---------|-----------------|
+| **触发入口** | `/auth/signup` 页面 | `/auth/signin` 页面点击 SSO 按钮 |
+| **主动/被动** | 用户主动注册 | 用户被动创建（首次登录时） |
+| **用户名** | 用户输入 | 自动生成 UUID |
+| **密码** | 用户设置 | 系统随机生成（用户未知） |
+| **受 `DisallowUserRegistration`** | ✅ 是 | ✅ 是 |
+| **受 `DisallowPasswordAuth`** | ✅ 是 | ❌ 否 |
+| **Admin 豁免** | ✅ 是（第一个用户） | ❌ 否（SSO 用户总是普通用户） |
+| **服务端验证位置** | `user_service.go:195-207` | `auth_service.go:158-160` |
+| **创建用户方式** | `Store.CreateUser()` 直接调用 | `Store.CreateUser()` 在 `resolveSSOUser` 中调用 |
+| **并发安全** | 依赖数据库唯一约束（用户名） | 有完整的并发处理逻辑（检查冲突 → 加载获胜者） |
 
 ---
 
