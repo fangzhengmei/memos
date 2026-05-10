@@ -317,6 +317,446 @@ WHERE json_extract(message, '$.activityId') IS NOT NULL;
 UPDATE user SET role = 'ADMIN' WHERE role = 'HOST';
 ```
 
+### 2.10 Schema 版本管理完整调用链
+
+迁移系统的核心入口是 `Migrate()` 函数，它协调整个版本管理流程。以下是完整的调用链分析：
+
+#### 2.10.1 主入口函数
+
+**位置**: `store/migrator.go:100-136`
+
+```go
+func (s *Store) Migrate(ctx context.Context) error {
+    // 步骤 1: 预迁移（新库初始化）
+    if err := s.preMigrate(ctx); err != nil {
+        return errors.Wrap(err, "failed to pre-migrate")
+    }
+
+    // 步骤 2: 读取当前数据库中的 schema 版本
+    instanceBasicSetting, err := s.GetInstanceBasicSetting(ctx)
+    
+    // 步骤 3: 获取代码期望的目标 schema 版本
+    currentSchemaVersion, err := s.GetCurrentSchemaVersion()
+    
+    // 步骤 4: 检查是否是降级操作（禁止降级）
+    if !isVersionEmpty(instanceBasicSetting.SchemaVersion) && 
+       version.IsVersionGreaterThan(instanceBasicSetting.SchemaVersion, currentSchemaVersion) {
+        return errors.Errorf("cannot downgrade schema version...")
+    }
+    
+    // 步骤 5: 判断是否需要迁移
+    if isVersionEmpty(instanceBasicSetting.SchemaVersion) || 
+       version.IsVersionGreaterThan(currentSchemaVersion, instanceBasicSetting.SchemaVersion) {
+        if err := s.applyMigrations(ctx, instanceBasicSetting.SchemaVersion, currentSchemaVersion); err != nil {
+            return errors.Wrap(err, "failed to apply migrations")
+        }
+    }
+    
+    // 步骤 6: Demo 模式注入种子数据
+    if s.profile.Demo {
+        if err := s.seed(ctx); err != nil {
+            return errors.Wrap(err, "failed to seed")
+        }
+    }
+    return nil
+}
+```
+
+#### 2.10.2 关键函数调用关系图
+
+```
+Migrate()
+    │
+    ├──► preMigrate()
+    │       │
+    │       ├──► driver.IsInitialized() ──┐
+    │       │                             │ 未初始化
+    │       │                             ▼
+    │       │                    执行 LATEST.sql
+    │       │                             │
+    │       │                    ┌────────▼────────┐
+    │       │                    │ GetCurrentSchemaVersion()
+    │       │                    │     (从迁移文件计算目标版本)
+    │       │                    └────────┬────────┘
+    │       │                             │
+    │       │                    ┌────────▼────────┐
+    │       │                    │ updateCurrentSchemaVersion()
+    │       │                    │  写入 system_setting (name='BASIC')
+    │       │                    └────────┬────────┘
+    │       │                             │
+    │       │                    (新库初始化完成)
+    │       │
+    │       └──► checkMinimumUpgradeVersion() ──┐
+    │                                            │ 旧版本检测
+    │                                            ▼
+    │                                    GetInstanceBasicSetting()
+    │                                            │
+    │                              ┌─────────────┴─────────────┐
+    │                              ▼                           ▼
+    │                        版本 >= 0.22.0              版本 < 0.22.0 或空
+    │                              │                           │
+    │                              OK                        报错退出
+    │
+    ├──► GetInstanceBasicSetting()  (读取当前数据库版本)
+    │       │
+    │       └──► GetInstanceSetting(name='BASIC')
+    │               │
+    │               ├──► 查缓存 instanceSettingCache
+    │               │       ├── 命中 → 直接返回
+    │               │       └── 未命中 → 继续
+    │               │
+    │               └──► ListInstanceSettings()
+    │                       │
+    │                       ├──► driver.ListInstanceSettings()
+    │                       │       └──► SELECT FROM system_setting WHERE name='BASIC'
+    │                       │
+    │                       └──► convertInstanceSettingFromRaw()
+    │                               └──► protojson.Unmarshal → storepb.InstanceBasicSetting
+    │
+    ├──► GetCurrentSchemaVersion()  (获取目标版本)
+    │       │
+    │       └──► 扫描所有迁移文件 → 提取版本号 → 返回最大版本
+    │
+    ├──► 降级检查 (DB版本 > 代码版本？)
+    │       └──► 是 → 报错退出
+    │
+    ├──► applyMigrations(currentVersion, targetVersion)
+    │       │
+    │       ├──► 开启事务
+    │       │
+    │       ├──► 收集并排序所有迁移文件
+    │       │
+    │       ├──► 遍历文件：
+    │       │       └──► shouldApplyMigration(fileVer, current, target)
+    │       │               └──► 是 → 执行 SQL
+    │       │
+    │       ├──► 提交事务
+    │       │
+    │       └──► updateCurrentSchemaVersion(targetVersion)
+    │               │
+    │               ├──► GetInstanceBasicSetting()
+    │               │
+    │               ├──► 修改 SchemaVersion 字段
+    │               │
+    │               └──► UpsertInstanceSetting()
+    │                       │
+    │                       ├──► protojson.Marshal(InstanceBasicSetting)
+    │                       │
+    │                       ├──► driver.UpsertInstanceSetting()
+    │                       │       └──► INSERT OR REPLACE INTO system_setting ...
+    │                       │
+    │                       └──► 更新缓存 instanceSettingCache
+    │
+    └──► seed()  (Demo 模式)
+            └──► 注入种子数据（包含 system_setting 的 MEMO_RELATED 记录）
+```
+
+#### 2.10.3 核心函数详解
+
+##### GetInstanceBasicSetting - 读取版本
+
+**位置**: `store/instance_setting.go:108-125`
+
+```go
+func (s *Store) GetInstanceBasicSetting(ctx context.Context) (*storepb.InstanceBasicSetting, error) {
+    // 1. 通过 GetInstanceSetting 读取
+    instanceSetting, err := s.GetInstanceSetting(ctx, &FindInstanceSetting{
+        Name: storepb.InstanceSettingKey_BASIC.String(),  // "BASIC"
+    })
+    
+    // 2. 提取 oneof 中的 BasicSetting
+    instanceBasicSetting := &storepb.InstanceBasicSetting{}
+    if instanceSetting != nil {
+        instanceBasicSetting = instanceSetting.GetBasicSetting()
+    }
+    
+    // 3. 更新缓存
+    s.instanceSettingCache.Set(ctx, storepb.InstanceSettingKey_BASIC.String(), ...)
+    
+    return instanceBasicSetting, nil
+}
+```
+
+**关键点**:
+- 如果 `name='BASIC'` 记录不存在，返回空的 `InstanceBasicSetting{}`（SchemaVersion = ""）
+- `isVersionEmpty("")` = true，`isVersionEmpty("0.0.0")` = true
+
+##### GetCurrentSchemaVersion - 计算目标版本
+
+**位置**: `store/migrator.go:299-319`
+
+```go
+func (s *Store) GetCurrentSchemaVersion() (string, error) {
+    filePaths, err := fs.Glob(migrationFS, fmt.Sprintf("%s*/*.sql", s.getMigrationBasePath()))
+    
+    currentSchemaVersion := defaultSchemaVersion  // "0.0.0"
+    for _, filePath := range filePaths {
+        fileSchemaVersion, err := s.getSchemaVersionOfMigrateScript(filePath)
+        if version.IsVersionGreaterThan(fileSchemaVersion, currentSchemaVersion) {
+            currentSchemaVersion = fileSchemaVersion
+        }
+    }
+    return currentSchemaVersion, nil
+}
+```
+
+**版本计算规则**:
+- 扫描 `migration/{driver}/*/*.sql` 所有文件
+- 提取路径中的版本号：`0.22/02__xxx.sql` → `0.22.3`
+- 返回最大版本号
+
+##### updateCurrentSchemaVersion - 写入版本
+
+**位置**: `store/migrator.go:355-368`
+
+```go
+func (s *Store) updateCurrentSchemaVersion(ctx context.Context, schemaVersion string) error {
+    // 1. 读取当前配置
+    instanceBasicSetting, err := s.GetInstanceBasicSetting(ctx)
+    
+    // 2. 修改版本号
+    instanceBasicSetting.SchemaVersion = schemaVersion
+    
+    // 3. 写回数据库
+    if _, err := s.UpsertInstanceSetting(ctx, &storepb.InstanceSetting{
+        Key:   storepb.InstanceSettingKey_BASIC,
+        Value: &storepb.InstanceSetting_BasicSetting{BasicSetting: instanceBasicSetting},
+    }); err != nil {
+        return errors.Wrap(err, "failed to upsert instance setting")
+    }
+    return nil
+}
+```
+
+**写入时的三层转换**:
+
+```
+Proto 层 (storepb.InstanceSetting):
+  { Key: BASIC, Value: BasicSetting{SchemaVersion: "0.28.0", SecretKey: "..."} }
+        ↓ protojson.Marshal
+Store 层 (InstanceSetting):
+  { Name: "BASIC", Value: "{\"schemaVersion\":\"0.28.0\",\"secretKey\":\"...\"}", Description: "" }
+        ↓ driver.UpsertInstanceSetting
+数据库层 (system_setting 表):
+  name:  'BASIC'
+  value: '{"schemaVersion":"0.28.0","secretKey":"..."}'
+  description: ''
+```
+
+### 2.11 三种场景下的 system_setting 状态变化
+
+#### 2.11.1 场景一：新库初始化
+
+**触发条件**: `driver.IsInitialized()` = false（无 `memo` 表）
+
+**执行路径**:
+
+```
+Migrate()
+    └──► preMigrate()
+            ├──► IsInitialized() = false
+            │
+            ├──► 读取 LATEST.sql
+            │       └──► 包含 CREATE TABLE system_setting (name, value, description)
+            │
+            ├──► 事务执行 LATEST.sql (仅建表，无初始数据)
+            │
+            ├──► GetCurrentSchemaVersion()
+            │       └──► 返回 "0.28.0" (最大迁移文件版本)
+            │
+            └──► updateCurrentSchemaVersion("0.28.0")
+                    ├──► GetInstanceBasicSetting()
+                    │       └──► system_setting 中无 'BASIC' 记录
+                    │       └──► 返回 InstanceBasicSetting{SchemaVersion: "", SecretKey: ""}
+                    │
+                    ├──► 设置 SchemaVersion = "0.28.0"
+                    │
+                    └──► UpsertInstanceSetting()
+                            └──► INSERT INTO system_setting
+                                    (name='BASIC', value='{"schemaVersion":"0.28.0",...}')
+```
+
+**system_setting 状态变化**:
+
+| 时间点 | 记录存在性 | name='BASIC' | value |
+|--------|-----------|--------------|-------|
+| **初始化前** | 无表 | - | - |
+| **LATEST.sql 执行后** | 表存在，无记录 | 不存在 | - |
+| **updateCurrentSchemaVersion 后** | 表存在，1 条记录 | `'BASIC'` | `{"schemaVersion":"0.28.0","secretKey":""}` |
+
+**注意**: `secretKey` 是空字符串，后续由其他逻辑生成并更新。
+
+#### 2.11.2 场景二：旧库升级
+
+**触发条件**: 
+- `IsInitialized()` = true（有数据）
+- 数据库版本 < 代码版本
+- 数据库版本 >= 0.22.0
+
+**执行路径** (假设 DB=0.27.0, 代码=0.28.0):
+
+```
+Migrate()
+    ├──► preMigrate()
+    │       ├──► IsInitialized() = true
+    │       │
+    │       └──► checkMinimumUpgradeVersion()
+    │               ├──► GetInstanceBasicSetting()
+    │               │       └──► 返回 {SchemaVersion: "0.27.0"}
+    │               │
+    │               └──► 0.27.0 >= 0.22.0 → OK
+    │
+    ├──► GetInstanceBasicSetting()
+    │       └──► SchemaVersion = "0.27.0" (数据库当前版本)
+    │
+    ├──► GetCurrentSchemaVersion()
+    │       └──► 目标版本 = "0.28.0"
+    │
+    ├──► 降级检查: 0.27.0 > 0.28.0? → NO
+    │
+    ├──► 版本比较: 0.28.0 > 0.27.0? → YES, 需要迁移
+    │
+    ├──► applyMigrations("0.27.0", "0.28.0")
+    │       │
+    │       ├──► 收集所有迁移文件
+    │       │
+    │       ├──► 遍历判断:
+    │       │       ├──► 0.10/* → 0.10.x > 0.27.0? NO
+    │       │       ├──► ...
+    │       │       ├──► 0.27/* → 0.27.x > 0.27.0? 部分 YES
+    │       │       └──► 0.28/* → 0.28.x > 0.27.0? YES
+    │       │
+    │       ├──► 事务执行符合条件的迁移 SQL
+    │       │
+    │       ├──► 提交事务
+    │       │
+    │       └──► updateCurrentSchemaVersion("0.28.0")
+    │               ├──► GetInstanceBasicSetting() → {SchemaVersion: "0.27.0"}
+    │               ├──► 修改 SchemaVersion = "0.28.0"
+    │               └──► UpsertInstanceSetting() (REPLACE)
+    │
+    └──► seed() (Demo 模式才执行)
+```
+
+**system_setting 状态变化**:
+
+| 时间点 | name='BASIC' 的 value |
+|--------|----------------------|
+| **迁移前** | `{"schemaVersion":"0.27.0","secretKey":"abc"}` |
+| **applyMigrations 中** | 保持 `0.27.0` (事务中) |
+| **事务提交后** | 保持 `0.27.0` (还未更新 version 记录) |
+| **updateCurrentSchemaVersion 后** | `{"schemaVersion":"0.28.0","secretKey":"abc"}` |
+
+**关键点**:
+- 迁移 SQL 和 version 更新分两个事务
+- 如果迁移 SQL 执行失败，version 记录保持不变
+- 如果 SQL 成功但 version 更新失败，下次启动会重新迁移（可能需要幂等性）
+
+#### 2.11.3 场景三：降级拦截
+
+**触发条件**: 
+- `IsInitialized()` = true
+- 数据库版本 > 代码版本
+
+**执行路径** (假设 DB=0.29.0, 代码=0.28.0):
+
+```
+Migrate()
+    ├──► preMigrate()
+    │       ├──► IsInitialized() = true
+    │       │
+    │       └──► checkMinimumUpgradeVersion()
+    │               └──► 0.29.0 >= 0.22.0 → OK
+    │
+    ├──► GetInstanceBasicSetting()
+    │       └──► SchemaVersion = "0.29.0" (数据库版本)
+    │
+    ├──► GetCurrentSchemaVersion()
+    │       └──► 目标版本 = "0.28.0" (代码版本)
+    │
+    ├──► 降级检查: 0.29.0 > 0.28.0? → YES!
+    │
+    ├──► 日志错误: cannot downgrade schema version
+    │
+    └──► 返回错误，程序退出
+```
+
+**system_setting 状态变化**:
+
+| 时间点 | name='BASIC' 的 value | 说明 |
+|--------|----------------------|------|
+| **检查前** | `{"schemaVersion":"0.29.0",...}` | 高版本数据 |
+| **降级检查后** | 保持不变 | 程序报错退出，无任何修改 |
+
+**保护机制代码** (`store/migrator.go:113-120`):
+
+```go
+// Check for downgrade (but skip if schema version is empty - that means fresh/old installation)
+if !isVersionEmpty(instanceBasicSetting.SchemaVersion) && 
+   version.IsVersionGreaterThan(instanceBasicSetting.SchemaVersion, currentSchemaVersion) {
+    slog.Error("cannot downgrade schema version",
+        slog.String("databaseVersion", instanceBasicSetting.SchemaVersion),
+        slog.String("currentVersion", currentSchemaVersion),
+    )
+    return errors.Errorf("cannot downgrade schema version from %s to %s", 
+        instanceBasicSetting.SchemaVersion, currentSchemaVersion)
+}
+```
+
+**例外情况**: `isVersionEmpty()` = true 时不检查降级
+
+这允许：
+- 新库初始化（version 为空）
+- v0.22 之前的旧库升级（version 可能为空或 0.0.0）
+
+### 2.12 三种场景对比总结
+
+| 维度 | 新库初始化 | 旧库升级 | 降级拦截 |
+|------|-----------|----------|----------|
+| **触发条件** | 无 memo 表 | 0.22 <= DB < 代码 | DB > 代码 |
+| **IsInitialized** | false | true | true |
+| **LATEST.sql** | 执行 | 不执行 | 不执行 |
+| **迁移脚本** | 不执行 | 执行增量 | 不执行 |
+| **updateCurrentSchemaVersion** | 执行 1 次 | 执行 1 次 | 不执行 |
+| **system_setting 变化** | 新增 'BASIC' 记录 | 更新 'BASIC' 的 value | 无变化 |
+| **最终 schema_version** | 代码版本 | 代码版本 | 保持高版本 |
+| **结果** | 成功 | 成功 | 失败退出 |
+| **seed() 调用** | Demo 模式调用 | Demo 模式调用 | 不调用 |
+
+### 2.13 version 字段的特殊值处理
+
+```go
+const defaultSchemaVersion = "0.0.0"
+
+func getSchemaVersionOrDefault(schemaVersion string) string {
+    if schemaVersion == "" {
+        return defaultSchemaVersion  // "" → "0.0.0"
+    }
+    return schemaVersion
+}
+
+func isVersionEmpty(schemaVersion string) bool {
+    return schemaVersion == "" || schemaVersion == defaultSchemaVersion
+}
+```
+
+**版本状态机**:
+
+```
+空字符串 ("")
+    │
+    ├──► GetInstanceBasicSetting 返回空
+    │       └──► isVersionEmpty = true
+    │
+    ├──► getSchemaVersionOrDefault 转换
+    │       └──► "0.0.0" (用于版本比较)
+    │
+    └──► 含义:
+            ├──► 新库刚创建（LATEST.sql 已执行但还没写 version）
+            ├──► v0.22 之前的旧库（system_setting 为空）
+            └──► 配置丢失或损坏
+```
+
 ## 3. 存储抽象层设计
 
 ### 3.1 架构图
