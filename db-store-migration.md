@@ -143,12 +143,114 @@ if err := tx.Commit(); err != nil {
 
 ### 2.7 版本管理
 
-**Schema 版本存储**: `instance_setting` 表中的 `BASIC` 配置
+**Schema 版本存储**: `system_setting` 表中的 `name = 'BASIC'` 记录
+
+**数据库表结构** (`store/migration/sqlite/LATEST.sql:1-7`):
+
+```sql
+CREATE TABLE system_setting (
+  name TEXT NOT NULL,
+  value TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  UNIQUE(name)
+);
+```
+
+**实际存储示例**:
+- `name`: `'BASIC'`
+- `value`: JSON 字符串，包含 `schemaVersion` 和 `secretKey`
+- `description`: 描述（可为空）
+
+**Store 层中间结构体** (`store/instance_setting.go:12-16`):
+
+```go
+type InstanceSetting struct {
+    Name        string  // 对应 system_setting.name
+    Value       string  // 对应 system_setting.value (JSON 字符串)
+    Description string  // 对应 system_setting.description
+}
+```
+
+**Proto 层定义** (`proto/store/instance_setting.proto:40-45`):
 
 ```protobuf
 message InstanceBasicSetting {
   string secret_key = 1;
   string schema_version = 2;  // 存储当前数据库的 schema 版本
+}
+```
+
+**三层映射关系（以 Schema 版本为例）**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  数据库层 (system_setting 表)                                        │
+│  ┌──────────────┬────────────────────────────────┬──────────────┐  │
+│  │ name         │ value                          │ description  │  │
+│  ├──────────────┼────────────────────────────────┼──────────────┤  │
+│  │ 'BASIC'      │ {"schemaVersion":"0.28.0",     │ ""           │  │
+│  │              │  "secretKey":"abc123..."}      │              │  │
+│  └──────────────┴────────────────────────────────┴──────────────┘  │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ protojson.Marshal/Unmarshal
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Store 层 (store/instance_setting.go)                               │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ type InstanceSetting struct {                               │   │
+│  │   Name        string  // "BASIC"                            │   │
+│  │   Value       string  // "{\"schemaVersion\":\"0.28.0\",...}"│   │
+│  │   Description string  // ""                                  │   │
+│  │ }                                                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ convertInstanceSettingFromRaw()                              │   │
+│  │   ↓ 根据 Name 选择正确的 oneof 类型                           │   │
+│  │ convertInstanceSettingToRaw()                                │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ oneof value 映射
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Proto 层 (proto/store/instance_setting.proto)                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ message InstanceSetting {                                   │   │
+│  │   InstanceSettingKey key = 1;           // BASIC            │   │
+│  │   oneof value {                                            │   │
+│  │     InstanceBasicSetting basic_setting = 2;                 │   │
+│  │     InstanceGeneralSetting general_setting = 3;             │   │
+│  │     InstanceStorageSetting storage_setting = 4;             │   │
+│  │     InstanceMemoRelatedSetting memo_related_setting = 5;    │   │
+│  │     InstanceTagsSetting tags_setting = 6;                   │   │
+│  │     InstanceNotificationSetting notification_setting = 7;    │   │
+│  │     InstanceAISetting ai_setting = 8;                       │   │
+│  │   }                                                         │   │
+│  │ }                                                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**转换函数** (`store/instance_setting.go:275-327`):
+
+```go
+func convertInstanceSettingFromRaw(instanceSettingRaw *InstanceSetting) (*storepb.InstanceSetting, error) {
+    instanceSetting := &storepb.InstanceSetting{
+        Key: storepb.InstanceSettingKey(storepb.InstanceSettingKey_value[instanceSettingRaw.Name]),
+    }
+    switch instanceSettingRaw.Name {
+    case storepb.InstanceSettingKey_BASIC.String():
+        basicSetting := &storepb.InstanceBasicSetting{}
+        if err := protojsonUnmarshaler.Unmarshal([]byte(instanceSettingRaw.Value), basicSetting); err != nil {
+            return nil, err
+        }
+        instanceSetting.Value = &storepb.InstanceSetting_BasicSetting{BasicSetting: basicSetting}
+    case storepb.InstanceSettingKey_GENERAL.String():
+        // ... 类似处理
+    // ... 其他 case
+    default:
+        return nil, nil
+    }
+    return instanceSetting, nil
 }
 ```
 
@@ -182,7 +284,7 @@ func (s *Store) checkMinimumUpgradeVersion(ctx context.Context) error {
 }
 ```
 
-**原因**: v0.22.0 将 schema 版本追踪从 `migration_history` 表迁移到了 `system_setting`（现 `instance_setting`）。
+**原因**: v0.22.0 将 schema 版本追踪从 `migration_history` 表迁移到了 `system_setting` 表。
 
 ### 2.9 迁移示例
 
@@ -220,22 +322,23 @@ UPDATE user SET role = 'ADMIN' WHERE role = 'HOST';
 ### 3.1 架构图
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      上层业务层                          │
-│        (server/services, runner, etc.)                   │
-└───────────────────────────┬─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      上层业务层                                    │
+│        (server/services, runner, etc.)                           │
+└───────────────────────────┬─────────────────────────────────────┘
                             │
-┌───────────────────────────▼─────────────────────────────┐
-│                      Store 层                            │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  业务方法封装 (CreateUser, ListMemos, etc.)        │  │
-│  │  + 缓存机制 (instanceSetting, user, userSetting)  │  │
-│  └───────────────────────────┬───────────────────────┘  │
-│                              │                          │
-│  ┌───────────────────────────▼───────────────────────┐  │
-│  │              Driver 接口 (store/driver.go)        │  │
-│  └───────────────────────────┬───────────────────────┘  │
-└──────────────────────────────┼──────────────────────────┘
+┌───────────────────────────▼─────────────────────────────────────┐
+│                      Store 层                                     │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  业务方法封装 (CreateUser, ListMemos, etc.)                │  │
+│  │  + 缓存机制 (instanceSetting, user, userSetting)          │  │
+│  │  + Proto ↔ Raw 结构体转换 (convert*FromRaw/ToRaw)         │  │
+│  └───────────────────────────┬───────────────────────────────┘  │
+│                              │                                    │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │              Driver 接口 (store/driver.go)                │  │
+│  └───────────────────────────┬───────────────────────────────┘  │
+└──────────────────────────────┼──────────────────────────────────┘
                                │
         ┌──────────────────────┼──────────────────────┐
         │                      │                      │
@@ -652,36 +755,177 @@ func TestMigrationFromStableVersion(t *testing.T) {
 }
 ```
 
-## 5. 关键设计总结
+## 5. 三层数据模型映射详解
 
-### 5.1 迁移系统设计要点
+### 5.1 映射架构总览
+
+Memos 采用三层数据模型设计，各层职责明确：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      上层业务层 (Services/Handlers)                  │
+│                    使用 Proto 类型 (storepb.*)                       │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │     Store 层转换        │
+                    │  convert*FromRaw/ToRaw │
+                    └────────────┬────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│                         Store 层 (Raw 结构体)                        │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  InstanceSetting: Name/Value(string)/Description              │ │
+│  │  UserSetting: UserID/Key/Value(string)                        │ │
+│  │  Memo: ID/UID/Content/Visibility/Pinned/Payload(*Proto)       │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │  Driver 层 SQL 执行     │
+                    │  protojson Marshal     │
+                    └────────────┬────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│                      数据库层 (Tables)                               │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │  system_setting: name/value(JSON)/description                 │ │
+│  │  user_setting: user_id/key/value(JSON)                        │ │
+│  │  memo: id/uid/content/visibility/pinned/payload(JSON)         │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 InstanceSetting 映射详解
+
+| 层级 | 类型/结构 | 关键字段 |
+|------|-----------|----------|
+| **数据库层** | `system_setting` 表 | `name` (TEXT), `value` (TEXT JSON), `description` (TEXT) |
+| **Store 层** | `store.InstanceSetting` 结构体 | `Name string`, `Value string`, `Description string` |
+| **Proto 层** | `storepb.InstanceSetting` message | `key` (enum), `value` (oneof) |
+
+**转换流程**:
+
+```
+写入 (Upsert):
+Proto (InstanceSetting{Key: BASIC, Value: BasicSetting{SchemaVersion: "0.28.0"}})
+  ↓ protojson.Marshal
+Store (InstanceSetting{Name: "BASIC", Value: "{\"schemaVersion\":\"0.28.0\"}", Description: ""})
+  ↓ SQL INSERT
+DB (system_setting: name='BASIC', value='{"schemaVersion":"0.28.0"}', description='')
+
+读取 (List):
+DB (system_setting: name='BASIC', value='{"schemaVersion":"0.28.0"}', description='')
+  ↓ SQL SELECT
+Store (InstanceSetting{Name: "BASIC", Value: "{\"schemaVersion\":\"0.28.0\"}", Description: ""})
+  ↓ convertInstanceSettingFromRaw → protojson.Unmarshal
+Proto (InstanceSetting{Key: BASIC, Value: BasicSetting{SchemaVersion: "0.28.0"}})
+```
+
+### 5.3 UserSetting 映射详解
+
+| 层级 | 类型/结构 | 关键字段 |
+|------|-----------|----------|
+| **数据库层** | `user_setting` 表 | `user_id` (INTEGER), `key` (TEXT), `value` (TEXT JSON) |
+| **Store 层** | `store.UserSetting` 结构体 | `UserID int32`, `Key storepb.UserSetting_Key`, `Value string` |
+| **Proto 层** | `storepb.UserSetting` message | `user_id`, `key` (enum), `value` (oneof) |
+
+**转换函数** (`store/user_setting.go:419-508`):
+
+```go
+func convertUserSettingFromRaw(raw *UserSetting) (*storepb.UserSetting, error) {
+    userSetting := &storepb.UserSetting{
+        UserId: raw.UserID,
+        Key:    raw.Key,
+    }
+    switch raw.Key {
+    case storepb.UserSetting_REFRESH_TOKENS:
+        refreshTokensUserSetting := &storepb.RefreshTokensUserSetting{}
+        if err := protojsonUnmarshaler.Unmarshal([]byte(raw.Value), refreshTokensUserSetting); err != nil {
+            return nil, err
+        }
+        userSetting.Value = &storepb.UserSetting_RefreshTokens{RefreshTokens: refreshTokensUserSetting}
+    // ... 其他 case
+    }
+    return userSetting, nil
+}
+```
+
+### 5.4 Memo 映射详解
+
+| 层级 | 类型/结构 | 关键字段 |
+|------|-----------|----------|
+| **数据库层** | `memo` 表 | `id`, `uid`, `creator_id`, `content`, `visibility`, `pinned`, `payload` (TEXT JSON) |
+| **Store 层** | `store.Memo` 结构体 | `ID int32`, `UID string`, `Content string`, `Visibility`, `Pinned bool`, `Payload *storepb.MemoPayload` |
+| **Proto 层** | `storepb.MemoPayload` message | `property`, `location`, `tags` (嵌套结构) |
+
+**注意**: Memo 的大部分字段直接映射，只有 `Payload` 字段需要 JSON 序列化：
+
+```go
+// 写入时 (store/db/sqlite/memo.go:20-26)
+payload := "{}"
+if create.Payload != nil {
+    payloadBytes, err := protojson.Marshal(create.Payload)
+    if err != nil {
+        return nil, err
+    }
+    payload = string(payloadBytes)
+}
+
+// 读取时 (store/db/sqlite/memo.go:180-184)
+payload := &storepb.MemoPayload{}
+if err := protojsonUnmarshaler.Unmarshal(payloadBytes, payload); err != nil {
+    return nil, errors.Wrap(err, "failed to unmarshal payload")
+}
+memo.Payload = payload
+```
+
+### 5.5 各层职责总结
+
+| 层级 | 职责 | 设计优势 |
+|------|------|----------|
+| **数据库层** | 物理存储，关系型表结构 | 标准化、可查询、ACID |
+| **Store 层 (Raw)** | 中间转换，统一驱动接口 | 隔离数据库差异，便于多数据库支持 |
+| **Proto 层** | 强类型定义，版本兼容 | 向后/向前兼容，API 稳定 |
+
+## 6. 关键设计总结
+
+### 6.1 迁移系统设计要点
 
 | 设计点 | 实现方式 | 优势 |
 |--------|----------|------|
-| 版本追踪 | instance_setting 中的 schema_version | 统一管理，易于查询 |
+| 版本追踪 | `system_setting` 表中 `name='BASIC'` 记录 | 统一管理，易于查询 |
 | 全新安装 | 直接应用 LATEST.sql | 快速初始化 |
 | 增量升级 | 按版本号顺序执行脚本 | 精确控制升级过程 |
 | 原子性 | 单事务包裹所有迁移 | 部分失败自动回滚 |
 | 降级保护 | 版本比较检查 | 防止版本回退 |
 | 旧版本支持 | 强制升级到 v0.25.3 过渡 | 平滑的升级路径 |
 
-### 5.2 存储抽象层设计要点
+### 6.2 存储抽象层设计要点
 
 | 层级 | 职责 | 关键实现 |
 |------|------|----------|
 | Driver | 数据库特定实现 | SQLite/MySQL/PostgreSQL 各自实现 Driver 接口 |
-| Store | 业务封装 + 缓存 | 参数验证、关联操作、缓存管理 |
+| Store | 业务封装 + 缓存 + 类型转换 | 参数验证、关联操作、缓存管理、Proto↔Raw 转换 |
 | Proto | 数据定义 | 版本兼容的结构化数据 |
 
-### 5.3 版本兼容性策略
+### 6.3 版本兼容性策略
 
 1. **Proto 字段编号**: 永不复用已分配的字段编号
 2. **DiscardUnknown**: 反序列化时忽略未知字段
 3. **默认值回退**: 缺失配置使用合理默认值
 4. **SQL 迁移**: 在数据库层面完成数据结构转换
 5. **版本检查**: 启动时验证 schema 版本兼容性
+6. **字段预留**: Proto 中使用 `reserved` 防止字段编号复用
 
-### 5.4 目录结构参考
+### 6.4 三层映射策略
+
+1. **直接映射字段**: 如 `memo.id`, `memo.uid`, `memo.content` — 直接读写
+2. **JSON 序列化字段**: 如 `memo.payload`, `system_setting.value` — Proto ↔ JSON ↔ DB
+3. **枚举映射**: 如 `InstanceSettingKey` — 枚举值 ↔ 字符串 ↔ DB
+4. **Oneof 映射**: 如 `InstanceSetting.value` — 根据 key 选择正确的反序列化类型
+
+### 6.5 目录结构参考
 
 ```
 store/
@@ -691,13 +935,15 @@ store/
 ├── common.go              # 通用配置（protojson）
 ├── memo.go                # Memo 业务方法
 ├── user.go                # User 业务方法
-├── instance_setting.go    # 实例设置（含缓存）
+├── user_setting.go        # UserSetting（含 convert 函数）
+├── instance_setting.go    # InstanceSetting（含缓存 + convert 函数）
 │
 ├── db/
 │   ├── db.go              # 驱动工厂
 │   ├── sqlite/
 │   │   ├── sqlite.go      # SQLite 驱动实现
 │   │   ├── memo.go        # SQLite Memo CRUD
+│   │   ├── instance_setting.go  # SQLite InstanceSetting CRUD
 │   │   └── ...
 │   ├── mysql/
 │   └── postgres/
@@ -718,17 +964,19 @@ store/
     └── migrator_test.go   # 迁移测试
 ```
 
-## 6. 最佳实践参考
+## 7. 最佳实践参考
 
 基于 Memos 的设计，可提炼出以下数据库层设计最佳实践：
 
 1. **驱动抽象**: 使用统一接口支持多数据库
-2. **两层 Store**: Driver 层做纯 CRUD，Store 层封装业务逻辑
+2. **三层 Store**: Driver 层做纯 CRUD，Store 层封装业务逻辑和类型转换，Proto 层定义数据结构
 3. **JSON + Proto**: 灵活的结构化数据存储 + 强类型定义
 4. **版本化迁移**: 语义化版本号 + 增量脚本 + LATEST 快照
 5. **DiscardUnknown**: 反序列化时忽略未知字段实现向前兼容
-6. **字段预留**: Proto 中使用 reserved 防止字段编号复用
+6. **字段预留**: Proto 中使用 `reserved` 防止字段编号复用
 7. **默认值策略**: 缺失配置使用合理默认值而非报错
 8. **事务迁移**: 所有迁移在单事务中执行保证原子性
 9. **升级测试**: 测试从旧版本到新版本的完整升级路径
 10. **缓存策略**: 高频读取数据使用内存缓存，写入时更新缓存
+11. **中间层转换**: 使用 `convert*FromRaw/ToRaw` 函数隔离各层差异
+12. **Oneof 模式**: 使用 Proto oneof + switch-case 处理多类型配置
