@@ -757,6 +757,517 @@ func isVersionEmpty(schemaVersion string) bool {
             └──► 配置丢失或损坏
 ```
 
+### 2.14 多数据库驱动差异分析
+
+Memos 同时支持 SQLite、MySQL、PostgreSQL 三种数据库，各驱动在迁移相关操作上存在关键差异。
+
+#### 2.14.1 初始化判断差异
+
+**SQLite** (`store/db/sqlite/sqlite.go:67-75`):
+
+```go
+func (d *DB) IsInitialized(ctx context.Context) (bool, error) {
+    var exists bool
+    err := d.db.QueryRowContext(ctx, 
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo')"
+    ).Scan(&exists)
+    return exists, err
+}
+```
+
+- 使用 SQLite 系统表 `sqlite_master`
+- 检查 `type='table'` 而非视图
+- 直接查询表名存在性
+
+**MySQL** (`store/db/mysql/mysql.go:51-58`):
+
+```go
+func (d *DB) IsInitialized(ctx context.Context) (bool, error) {
+    var exists bool
+    err := d.db.QueryRowContext(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE TABLE_SCHEMA = DATABASE() 
+            AND TABLE_NAME = 'memo' 
+            AND TABLE_TYPE = 'BASE TABLE'
+        )`
+    ).Scan(&exists)
+    return exists, err
+}
+```
+
+- 使用 `information_schema.tables`
+- `TABLE_SCHEMA = DATABASE()` 限制当前数据库
+- `TABLE_TYPE = 'BASE TABLE'` 排除视图
+
+**PostgreSQL** (`store/db/postgres/postgres.go:50-57`):
+
+```go
+func (d *DB) IsInitialized(ctx context.Context) (bool, error) {
+    var exists bool
+    err := d.db.QueryRowContext(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_catalog = current_database() 
+            AND table_name = 'memo' 
+            AND table_type = 'BASE TABLE'
+        )`
+    ).Scan(&exists)
+    return exists, err
+}
+```
+
+- 使用 `information_schema.tables`
+- `table_catalog = current_database()` 限制当前数据库
+- 字段名小写（PostgreSQL 标准）
+
+**差异总结表**:
+
+| 维度 | SQLite | MySQL | PostgreSQL |
+|------|--------|-------|------------|
+| **元数据来源** | `sqlite_master` | `information_schema.tables` | `information_schema.tables` |
+| **当前库标识** | 无（单文件单库） | `TABLE_SCHEMA = DATABASE()` | `table_catalog = current_database()` |
+| **表类型过滤** | `type='table'` | `TABLE_TYPE = 'BASE TABLE'` | `table_type = 'BASE TABLE'` |
+| **标识符大小写** | 任意 | 反引号包裹 | 小写（自动转换） |
+
+#### 2.14.2 连接配置差异
+
+**SQLite 特有配置** (`store/db/sqlite/sqlite.go:49`):
+
+```go
+sqliteDB, err := sql.Open("sqlite", profile.DSN + 
+    "?_pragma=foreign_keys(0)" +
+    "&_pragma=busy_timeout(10000)" +
+    "&_pragma=journal_mode(WAL)" +
+    "&_pragma=mmap_size(0)")
+```
+
+| 配置 | 说明 | 迁移影响 |
+|------|------|----------|
+| `foreign_keys(0)` | 禁用外键约束 | 简化迁移脚本，无需考虑外键顺序 |
+| `journal_mode(WAL)` | WAL 模式 | 支持并发读写，减少锁等待 |
+| `busy_timeout(10000)` | 10 秒锁等待 | 迁移时避免 `database is locked` 错误 |
+| `mmap_size(0)` | 禁用内存映射 | 避免大数据库 OOM |
+
+**MySQL 特有配置** (`store/db/mysql/mysql.go:72-79`):
+
+```go
+func mergeDSN(baseDSN string) (string, error) {
+    config, err := mysql.ParseDSN(baseDSN)
+    config.MultiStatements = true  // 关键！
+    return config.FormatDSN(), nil
+}
+```
+
+- `MultiStatements = true`: 允许一次执行多条 SQL 语句
+- **迁移必要性**: 迁移脚本文件通常包含多条 SQL，需要此配置才能正确执行
+- **安全风险**: 增加 SQL 注入风险，但迁移脚本是静态的（embed 打包），风险可控
+
+**PostgreSQL 特有配置**:
+
+- 无特殊 DSN 配置，使用标准连接串
+- 参数占位符使用 `$1, $2` 格式，而非 `?`
+
+```go
+func placeholder(n int) string {
+    return "$" + fmt.Sprint(n)  // 动态生成 $1, $2, $3...
+}
+```
+
+#### 2.14.3 迁移脚本执行差异
+
+**SQL 语法差异**:
+
+| 操作 | SQLite | MySQL | PostgreSQL |
+|------|--------|-------|------------|
+| **自动增量** | `AUTOINCREMENT` | `AUTO_INCREMENT` | `SERIAL` 或 `GENERATED AS IDENTITY` |
+| **字符串引号** | 单引号 `'` | 单/双引号 `'`/`"` | 单引号 `'`（双引号=标识符） |
+| **标识符引用** | 双引号 `"` | 反引号 `` ` `` | 双引号 `"` |
+| **TRUE/FALSE** | 支持 | 支持（别名 1/0） | 支持 |
+| **LIMIT** | `LIMIT n` | `LIMIT n` | `LIMIT n` |
+| **JSON 函数** | `json_extract`, `json_set` | `JSON_EXTRACT`, `JSON_SET` | `->>`, `jsonb_set` |
+
+**迁移脚本组织**:
+
+每个驱动有独立的迁移目录：
+
+```
+store/migration/
+├── sqlite/
+│   ├── 0.10/
+│   │   └── 00__activity.sql      (SQLite 语法)
+│   ├── ...
+│   └── LATEST.sql                (SQLite 完整 schema)
+├── mysql/
+│   └── ... (MySQL 语法)
+└── postgres/
+    └── ... (PostgreSQL 语法)
+```
+
+**路径选择逻辑** (`store/migrator.go:254-256`):
+
+```go
+func (s *Store) getMigrationBasePath() string {
+    return fmt.Sprintf("migration/%s/", s.profile.Driver)
+    // "migration/sqlite/" or "migration/mysql/" or "migration/postgres/"
+}
+```
+
+#### 2.14.4 Schema 版本更新差异
+
+**Upsert 语法差异**:
+
+**SQLite** (`store/db/sqlite/instance_setting.go:10-26`):
+
+```go
+stmt := `
+    INSERT INTO system_setting (name, value, description)
+    VALUES (?, ?, ?)
+    ON CONFLICT(name) DO UPDATE
+    SET value = EXCLUDED.value, description = EXCLUDED.description
+`
+```
+
+- 使用 `ON CONFLICT(name) DO UPDATE`
+- 通过 `EXCLUDED` 引用冲突行的新值
+- 参数占位符 `?`
+
+**MySQL** (`store/db/mysql/instance_setting.go:10-26`):
+
+```go
+stmt := "INSERT INTO `system_setting` (`name`, `value`, `description`) " +
+        "VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `value` = ?, `description` = ?"
+// 参数: name, value, desc, value, desc (注意 value/desc 出现两次)
+```
+
+- 使用 `ON DUPLICATE KEY UPDATE`
+- 参数需要重复传递（共 5 个参数而非 3 个）
+- 使用反引号引用标识符
+
+**PostgreSQL** (`store/db/postgres/instance_setting.go:10-26`):
+
+```go
+stmt := `
+    INSERT INTO system_setting (name, value, description)
+    VALUES ($1, $2, $3)
+    ON CONFLICT(name) DO UPDATE
+    SET value = EXCLUDED.value, description = EXCLUDED.description
+`
+```
+
+- 语法与 SQLite 相同（标准 SQL 方式）
+- 参数占位符 `$1, $2, $3`
+
+**Upsert 差异表**:
+
+| 维度 | SQLite | MySQL | PostgreSQL |
+|------|--------|-------|------------|
+| **语法** | `ON CONFLICT(...) DO UPDATE` | `ON DUPLICATE KEY UPDATE` | `ON CONFLICT(...) DO UPDATE` |
+| **新值引用** | `EXCLUDED.column` | 直接列名 | `EXCLUDED.column` |
+| **参数数量** | 3 个 | 5 个（重复 2 次） | 3 个 |
+| **占位符** | `?` | `?` | `$1, $2, $3` |
+| **冲突条件** | 必须指定冲突列 | 任意唯一键冲突 | 必须指定冲突列 |
+
+### 2.15 迁移失败的风险边界分析
+
+#### 2.15.1 问题场景：迁移 SQL 成功但 version 写回失败
+
+**发生场景**:
+
+```
+applyMigrations() 执行流程:
+
+1. tx, err := s.driver.GetDB().Begin()     ✓ 成功
+2. 遍历迁移文件，执行 SQL                  ✓ 全部成功
+3. tx.Commit()                              ✓ 事务提交
+   └─ 此时数据库 schema 已变更
+   
+4. updateCurrentSchemaVersion(ctx, targetVersion)  ✗ 失败！
+   ├─ GetInstanceBasicSetting()
+   ├─ 修改 SchemaVersion
+   └─ UpsertInstanceSetting()  → 失败（网络中断、连接池耗尽等）
+```
+
+**失败原因可能**:
+- 数据库连接池耗尽
+- 网络短暂中断
+- 数据库重启
+- 系统资源不足
+- 并发锁冲突
+
+#### 2.15.2 重启后的行为分析
+
+**假设**:
+- 迁移 SQL 已提交（schema 已变更到 v0.28）
+- version 记录仍为 v0.27
+- 服务崩溃后重启
+
+**重启时的执行路径**:
+
+```
+Migrate()
+    │
+    ├──► preMigrate()
+    │       ├──► IsInitialized() = true
+    │       │
+    │       └──► checkMinimumUpgradeVersion()
+    │               └──► 0.27 >= 0.22 → OK
+    │
+    ├──► GetInstanceBasicSetting()
+    │       └──► SchemaVersion = "0.27" (旧版本)
+    │
+    ├──► GetCurrentSchemaVersion()
+    │       └──► 目标 = "0.28"
+    │
+    ├──► 降级检查: 0.27 > 0.28? → NO
+    │
+    └──► applyMigrations("0.27", "0.28")
+            │
+            ├──► 收集所有迁移文件
+            │
+            ├──► 遍历判断:
+            │       ├──► 0.28/* → shouldApply(0.28, 0.27, 0.28) = YES
+            │       └──► 重新执行这些迁移！
+            │
+            ├──► 事务内执行（问题可能在这里）
+            │
+            └──► updateCurrentSchemaVersion("0.28")
+```
+
+**关键点**: `shouldApplyMigration` 函数只看版本号，不检查 schema 实际状态！
+
+```go
+func shouldApplyMigration(fileVersion, currentDBVersion, targetVersion string) bool {
+    currentDBVersionSafe := getSchemaVersionOrDefault(currentDBVersion)
+    return version.IsVersionGreaterThan(fileVersion, currentDBVersionSafe) &&
+           version.IsVersionGreaterOrEqualThan(targetVersion, fileVersion)
+}
+```
+
+#### 2.15.3 风险分类：迁移脚本的幂等性
+
+**安全的迁移（可重复执行）**:
+
+| 类型 | 示例 | 重复执行结果 |
+|------|------|-------------|
+| `CREATE INDEX IF NOT EXISTS` | `CREATE UNIQUE INDEX IF NOT EXISTS idx_idp_uid ON idp (uid)` | 跳过已存在的索引 |
+| 条件 `UPDATE` | `UPDATE inbox SET ... WHERE json_extract(message, '$.activityId') IS NOT NULL` | 条件已不满足，无操作 |
+| 事务回滚 | 整个事务失败 | 无副作用 |
+
+**不安全的迁移（不可重复执行）**:
+
+| 类型 | 示例 | 重复执行结果 |
+|------|------|-------------|
+| `ALTER TABLE ADD COLUMN` | `ALTER TABLE memo ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'` | **错误**: `duplicate column name` |
+| `CREATE INDEX` (无 IF NOT EXISTS) | `CREATE INDEX idx_memo_tags ON memo (tags)` | **错误**: 索引已存在 |
+| 无条件数据修改 | `UPDATE user SET role = 'ADMIN' WHERE role = 'HOST'` | 数据可能已被其他方式修改 |
+
+**实际迁移脚本分析**:
+
+**示例 1: 安全** (`store/migration/sqlite/0.27/01__add_idp_uid.sql`):
+
+```sql
+ALTER TABLE idp ADD COLUMN uid TEXT NOT NULL DEFAULT '';  -- 非幂等！
+UPDATE idp SET uid = printf('%08x', id) WHERE uid = '';   -- 幂等（条件过滤）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idp_uid ON idp (uid);  -- 幂等
+```
+
+- `ALTER TABLE ADD COLUMN`: **非幂等**，重复执行会报错
+- `UPDATE ... WHERE uid = ''`: 幂等
+- `CREATE INDEX IF NOT EXISTS`: 幂等
+
+**示例 2: 非幂等** (`store/migration/sqlite/0.22/02__memo_payload.sql`):
+
+```sql
+ALTER TABLE memo ADD COLUMN payload TEXT NOT NULL DEFAULT '{}';  -- 非幂等！
+```
+
+**示例 3: 非幂等** (`store/migration/sqlite/0.22/01__memo_tags.sql`):
+
+```sql
+ALTER TABLE memo ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';  -- 非幂等！
+CREATE INDEX idx_memo_tags ON memo (tags);  -- 非幂等（无 IF NOT EXISTS）！
+```
+
+#### 2.15.4 风险边界分析
+
+**场景一：非幂等迁移脚本重复执行**
+
+```
+时间线:
+
+T1: 首次启动
+   ├─ 执行 0.28.1: ALTER TABLE memo ADD COLUMN foo
+   ├─ 事务提交成功
+   └─ version 写入失败（服务崩溃）
+   
+T2: 重启
+   ├─ 检测 DB version = 0.27
+   ├─ 重新执行 0.28.1: ALTER TABLE memo ADD COLUMN foo
+   └─ ❌ 错误: duplicate column name 'foo'
+```
+
+**后果**:
+- 服务无法启动
+- 数据库实际 schema 已升级，但无法完成迁移流程
+- 需要手动介入修复
+
+**场景二：幂等迁移脚本重复执行**
+
+```
+T1: 首次启动
+   ├─ 执行: CREATE INDEX IF NOT EXISTS idx_xxx
+   └─ version 写入失败
+   
+T2: 重启
+   ├─ 执行: CREATE INDEX IF NOT EXISTS idx_xxx → 跳过
+   ├─ 执行: UPDATE ... WHERE condition → 条件不满足，跳过
+   └─ ✓ 成功完成，version 更新
+```
+
+**后果**:
+- 无副作用，正常完成
+
+**场景三：条件数据修改重复执行**
+
+```sql
+-- 0.26/04__migrate_host_to_admin.sql
+UPDATE user SET role = 'ADMIN' WHERE role = 'HOST';
+```
+
+```
+T1: 首次启动
+   ├─ UPDATE: HOST → ADMIN
+   └─ version 写入失败
+   
+T2: 重启
+   ├─ UPDATE: WHERE role = 'HOST' → 无匹配行
+   └─ ✓ 无副作用
+```
+
+**后果**: 安全，第二次执行无操作
+
+#### 2.15.5 实际风险评估
+
+根据代码库分析，**大部分迁移脚本是非幂等的**：
+
+| 风险类型 | 示例文件 | 风险等级 |
+|----------|----------|----------|
+| `ALTER TABLE ADD COLUMN` | 0.22/02, 0.27/01, 0.28/00 | 🔴 高 |
+| `CREATE INDEX` (无 IF NOT EXISTS) | 0.22/01 | 🔴 高 |
+| `CREATE INDEX IF NOT EXISTS` | 0.27/01 | 🟢 低 |
+| 条件 UPDATE | 0.27/02, 0.26/04 | 🟢 低 |
+
+**高风险迁移比例估算**: 约 60-70% 的迁移脚本存在重复执行风险
+
+#### 2.15.6 缓解措施与建议
+
+**当前代码的保护机制**:
+
+1. **事务原子性**: 迁移 SQL 在事务中执行
+   - 如果 SQL 执行中途失败，事务回滚
+   - 但事务提交后，SQL 已持久化
+
+2. **但**: version 更新在另一个事务中
+   - 两个操作不是原子的
+   - 存在时间窗口风险
+
+**架构改进建议**:
+
+**方案 A: 将 version 更新纳入同一事务**
+
+```go
+func (s *Store) applyMigrations(ctx context.Context, current, target string) error {
+    tx, err := s.driver.GetDB().Begin()
+    // ... 执行迁移 SQL ...
+    
+    // 在同一事务内更新 version
+    if err := s.updateCurrentSchemaVersionInTx(ctx, tx, target); err != nil {
+        return err
+    }
+    
+    return tx.Commit()  // 原子提交
+}
+```
+
+**方案 B: 引入 migration_history 表**
+
+```sql
+CREATE TABLE migration_history (
+    id INTEGER PRIMARY KEY,
+    version TEXT NOT NULL,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN DEFAULT TRUE
+);
+```
+
+每次迁移开始检查 `migration_history`，而非 `schema_version`
+
+**方案 C: 确保所有迁移脚本幂等**
+
+```sql
+-- 非幂等写法
+ALTER TABLE memo ADD COLUMN payload TEXT;
+
+-- 幂等写法 (SQLite)
+ALTER TABLE memo ADD COLUMN IF NOT EXISTS payload TEXT;
+
+-- MySQL 没有 ADD COLUMN IF NOT EXISTS，需要检查 information_schema
+```
+
+注意：**并非所有数据库都支持 `IF NOT EXISTS` for ADD COLUMN**
+
+| 数据库 | `CREATE TABLE IF NOT EXISTS` | `ALTER TABLE ADD COLUMN IF NOT EXISTS` |
+|--------|-----------------------------|--------------------------------------|
+| SQLite 3.35+ | ✓ | ✓ |
+| MySQL | ✓ | ✗（无此语法） |
+| PostgreSQL | ✓ | ✓ (PG 12+) |
+
+**当前代码的风险控制**:
+
+实际上，`updateCurrentSchemaVersion` 失败的概率**非常低**，因为：
+
+1. 它紧跟在成功的数据库操作之后
+2. 只是一条简单的 Upsert 语句
+3. 数据库连接应该仍然有效
+
+但在以下极端场景下仍可能发生：
+- 数据库在事务提交后、version 写入前重启
+- 网络在极短时间窗口内中断
+
+#### 2.15.7 手动恢复指南
+
+如果不幸遇到 "SQL 成功但 version 写入失败" 的情况：
+
+**步骤 1: 确认数据库 schema 实际状态**
+
+```sql
+-- 检查列是否已存在
+PRAGMA table_info(memo);                    -- SQLite
+SHOW COLUMNS FROM memo;                     -- MySQL
+SELECT column_name FROM information_schema.columns 
+WHERE table_name='memo';                   -- PostgreSQL
+```
+
+**步骤 2: 手动更新 schema_version**
+
+```sql
+-- 找到当前目标版本
+-- 然后手动写入 system_setting
+
+-- SQLite/PostgreSQL:
+UPDATE system_setting 
+SET value = json_set(value, '$.schemaVersion', '0.28.0')
+WHERE name = 'BASIC';
+
+-- MySQL:
+UPDATE system_setting 
+SET value = JSON_SET(value, '$.schemaVersion', '0.28.0')
+WHERE name = 'BASIC';
+```
+
+**步骤 3: 重启服务**
+
 ## 3. 存储抽象层设计
 
 ### 3.1 架构图
