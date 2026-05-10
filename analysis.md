@@ -366,11 +366,12 @@ case "display_name":
 
 ## 五、设置变更后旧页面状态处理
 
-### 5.1 实例设置更新流程
+### 5.1 设置更新流程
 
-#### 1. 更新钩子（`web/src/components/Settings/useInstanceSettingUpdater.ts:16-34`）
+#### 5.1.1 实例设置更新（`useInstanceSettingUpdater.ts`）
 
 ```typescript
+// 关键代码位置：web/src/components/Settings/useInstanceSettingUpdater.ts:16-34
 const useInstanceSettingUpdater = () => {
   const t = useTranslate();
   const { updateSetting, fetchSetting } = useInstance();
@@ -392,7 +393,7 @@ const useInstanceSettingUpdater = () => {
 };
 ```
 
-#### 2. Context 状态同步（`web/src/contexts/InstanceContext.tsx:192-198`）
+**Context 状态同步（`InstanceContext.tsx:192-198`）：**
 
 ```typescript
 const updateSetting = useCallback(async (setting: InstanceSetting) => {
@@ -409,7 +410,150 @@ const updateSetting = useCallback(async (setting: InstanceSetting) => {
 2. 用新设置替换旧设置（通过 `setState`）
 3. 所有使用 `useInstance()` 的组件会自动响应式更新
 
-### 5.2 实时动态更新的设置
+---
+
+### 5.2 设置变更后的状态差异分析
+
+设置变更后，不同场景下的状态表现不同：
+
+#### 5.2.1 已打开页面的状态
+
+**同标签页内：**
+
+| 场景 | 行为 | 原因 |
+|-----|------|------|
+| 修改设置的页面 | 即时更新 | React Context 响应式更新 |
+| 已渲染但未重新挂载的组件 | 可能滞后 | 依赖 useMemo/useEffect 的依赖数组 |
+
+**关键代码（编辑器组件的可见性设置更新）：**
+
+```typescript
+// 关键代码位置：web/src/components/MemoEditor/index.tsx:279-280
+useEffect(() => {
+  if (!memoName && defaultVisibility) {
+    dispatch(actions.setMetadata({ visibility: defaultVisibility }));
+  }
+}, [dispatch, defaultVisibility, memoName]);
+```
+
+**注意：** 这个 effect 只在 `defaultVisibility` 变化且 `memoName` 为空时触发。如果用户已经手动修改了可见性，设置变更**不会覆盖**用户的手动选择。
+
+**编辑器中的行为总结：**
+- **新建备忘录（未开始编辑）**：设置变更后，默认可见性会更新
+- **新建备忘录（已开始编辑）**：如果用户已手动选择可见性，设置变更不会覆盖
+- **编辑已有备忘录**：使用备忘录自身的可见性，不受默认可见性设置影响
+
+---
+
+#### 5.2.2 草稿缓存的状态
+
+**草稿缓存的存储机制（`cacheService.ts`）：**
+
+```typescript
+// 关键代码位置：web/src/components/MemoEditor/services/cacheService.ts:32-76
+export const cacheService = {
+  // 只保存 content，不保存 visibility
+  save: (key: string, content: string) => {
+    // ...
+  },
+  load(key: string): string {
+    const raw = localStorage.getItem(key);
+    return raw ? deserializeContent(raw) : "";  // 只返回 content
+  },
+  // ...
+};
+```
+
+**草稿加载时的行为（`useMemoInit.ts:40-46`）：**
+
+```typescript
+const cachedContent = cacheService.load(key);
+if (cachedContent) {
+  dispatch(actions.updateContent(cachedContent));  // 只恢复内容
+}
+if (defaultVisibility !== undefined) {
+  dispatch(actions.setMetadata({ visibility: defaultVisibility }));  // 使用当前默认可见性
+}
+```
+
+**草稿缓存与设置变更的关系：**
+
+| 维度 | 行为 |
+|-----|------|
+| 草稿内容 | 保存在 localStorage，不受设置变更影响 |
+| 草稿可见性 | **不保存**，每次重新加载时使用当前默认设置 |
+| 已保存的备忘录 | 可见性已落库，不受设置变更影响 |
+
+**场景示例：**
+
+```
+场景：默认可见性从 PRIVATE 改为 PUBLIC
+
+时间线：
+1. T=0: 默认可见性 = PRIVATE
+2. T=1: 用户开始写草稿，保存为草稿（只保存内容）
+3. T=2: 用户修改默认可见性为 PUBLIC
+4. T=3: 用户重新打开编辑器
+
+结果：
+- 草稿内容：恢复 T=1 时的内容
+- 草稿可见性：使用 T=3 的默认值 PUBLIC（不是 T=1 的 PRIVATE）
+```
+
+---
+
+#### 5.2.3 跨标签页的状态差异
+
+**Token 同步机制（`auth-state.ts`）：**
+
+```typescript
+// 关键代码位置：web/src/auth-state.ts:9-46
+const TOKEN_CHANNEL_NAME = "memos_token_sync";
+
+let tokenChannel: BroadcastChannel | null = null;
+
+function getTokenChannel(): BroadcastChannel | null {
+  if (tokenChannel) return tokenChannel;
+  try {
+    tokenChannel = new BroadcastChannel(TOKEN_CHANNEL_NAME);
+    tokenChannel.onmessage = (event: MessageEvent<TokenBroadcastMessage>) => {
+      const { token, expiresAt } = event.data ?? {};
+      if (token && expiresAt) {
+        accessToken = token;
+        tokenExpiresAt = new Date(expiresAt);
+      }
+    };
+  } catch {
+    tokenChannel = null;
+  }
+  return tokenChannel;
+}
+```
+
+**关键发现：**
+- `BroadcastChannel` 只用于**token 同步**，**不用于设置同步**
+- 设置变更不会广播到其他标签页
+
+**跨标签页的状态表现：**
+
+| 标签页 | 状态 | 原因 |
+|-------|------|------|
+| 修改设置的标签页 | 即时更新 | Context 响应式更新 |
+| 其他已打开的标签页 | 保持旧值 | 没有 SSE/Broadcast 推送 |
+| 新打开的标签页 | 使用新值 | 初始化时从服务器获取 |
+
+**跨标签页同步机制对比：**
+
+| 同步对象 | 机制 | 是否跨标签页 |
+|---------|------|-------------|
+| Access Token | BroadcastChannel | ✅ 是 |
+| 实例设置 | React Context | ❌ 否 |
+| 用户设置 | React Context | ❌ 否 |
+| 备忘录数据 | SSE (useLiveMemoRefresh) | ✅ 是 |
+
+---
+
+### 5.3 实时动态更新的设置
 
 #### App 级别的实时响应（`web/src/App.tsx:31-57`）
 
@@ -444,7 +588,15 @@ useEffect(() => {
 }, [instanceGeneralSetting.customProfile]);
 ```
 
-### 5.3 SSE 实时刷新机制
+**实时响应的设置：**
+- `additionalStyle`：立即注入 `<style>` 标签
+- `additionalScript`：立即注入 `<script>` 标签
+- `customProfile.title`：立即更新 `document.title`
+- `customProfile.logoUrl`：立即更新 favicon
+
+---
+
+### 5.4 SSE 实时刷新机制
 
 Memos 使用 SSE (Server-Sent Events) 实现备忘录的实时更新，但**不用于实例设置的实时同步**：
 
@@ -453,23 +605,11 @@ Memos 使用 SSE (Server-Sent Events) 实现备忘录的实时更新，但**不�
 // 只处理备忘录变更事件，不处理设置变更
 ```
 
-### 5.4 旧页面状态处理的限制
+---
 
-**当前实现的特点：**
+### 5.5 敏感设置的服务端保护
 
-1. **单页面内即时响应**：
-   - 设置页面内修改后，同一页面的其他组件会立即响应
-   - 基于 React Context 的响应式更新
-
-2. **跨标签页/跨会话不实时同步**：
-   - 没有 SSE 事件推送设置变更
-   - 其他标签页需要刷新或重新初始化才能看到新设置
-
-3. **初始化时加载**：
-   - 页面加载时调用 `InstanceContext.initialize()` 获取最新设置
-   - 登录后调用 `AuthContext.initialize()` 获取用户设置
-
-4. **敏感设置的服务端保护**（`server/router/api/v1/instance_service.go:128-165`）：
+即使前端绕过，服务端也会保护敏感设置（`server/router/api/v1/instance_service.go:128-165`）：
 
 ```go
 // Storage 和 Notification 设置包含凭据，只允许管理员访问
@@ -496,6 +636,23 @@ if instanceSetting.Key == storepb.InstanceSettingKey_AI && !isAdminCaller {
     }
 }
 ```
+
+---
+
+### 5.6 设置变更后状态差异总结
+
+| 场景 | 已打开页面 | 草稿缓存 | 跨标签页 |
+|-----|-----------|---------|---------|
+| **同标签页内** | ✅ 即时更新 | 不影响（只存内容） | N/A |
+| **用户手动修改过** | ❌ 不覆盖 | 不保存 | N/A |
+| **草稿重新打开** | N/A | 使用新默认值 | N/A |
+| **其他标签页** | N/A | N/A | ❌ 保持旧值 |
+| **新标签页** | ✅ 使用新值 | ✅ 使用新值 | ✅ 使用新值 |
+
+**刷新时机：**
+- 页面刷新：重新初始化，获取最新设置
+- 重新登录：重新初始化用户设置
+- 导航切换：如果组件重新挂载，会使用最新 Context 值
 
 ---
 
