@@ -1237,36 +1237,299 @@ ALTER TABLE memo ADD COLUMN IF NOT EXISTS payload TEXT;
 
 #### 2.15.7 手动恢复指南
 
-如果不幸遇到 "SQL 成功但 version 写入失败" 的情况：
+如果不幸遇到 "SQL 成功但 version 写入失败" 的情况，请按以下步骤操作。
+
+> **⚠️ 重要提示**: 三个数据库的 JSON 语法完全不同，请勿跨库混用！
+
+**前置准备：确定目标版本号**
+
+首先确认当前代码期望的目标版本：
+
+```bash
+# 方式 1: 查看最新迁移文件版本
+ls -la store/migration/sqlite/ | tail -20
+# 或查看 GetCurrentSchemaVersion() 返回值
+
+# 方式 2: 从代码中查找
+# 查看 store/migration/sqlite/ 下的版本目录
+# 如 0.28/00__user_identity.sql → 版本 0.28.1
+```
+
+---
 
 **步骤 1: 确认数据库 schema 实际状态**
 
+执行以下检查，确认迁移 SQL 确实已执行（列/索引已存在）：
+
+**SQLite**:
 ```sql
--- 检查列是否已存在
-PRAGMA table_info(memo);                    -- SQLite
-SHOW COLUMNS FROM memo;                     -- MySQL
-SELECT column_name FROM information_schema.columns 
-WHERE table_name='memo';                   -- PostgreSQL
+-- 检查表是否存在
+SELECT name FROM sqlite_master WHERE type='table' AND name='memo';
+
+-- 检查列是否存在
+PRAGMA table_info(memo);
+
+-- 检查索引是否存在
+SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%';
+
+-- 查看当前 system_setting 中的 BASIC 记录
+SELECT name, value FROM system_setting WHERE name = 'BASIC';
 ```
 
-**步骤 2: 手动更新 schema_version**
-
+**MySQL**:
 ```sql
--- 找到当前目标版本
--- 然后手动写入 system_setting
+-- 检查表是否存在
+SELECT TABLE_NAME FROM information_schema.tables 
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memo';
 
--- SQLite/PostgreSQL:
+-- 检查列是否存在
+SHOW COLUMNS FROM memo;
+-- 或
+SELECT COLUMN_NAME FROM information_schema.columns 
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memo';
+
+-- 检查索引是否存在
+SHOW INDEX FROM memo;
+
+-- 查看当前 system_setting 中的 BASIC 记录
+SELECT `name`, `value` FROM `system_setting` WHERE `name` = 'BASIC';
+```
+
+**PostgreSQL**:
+```sql
+-- 检查表是否存在
+SELECT table_name FROM information_schema.tables 
+WHERE table_catalog = current_database() AND table_name = 'memo';
+
+-- 检查列是否存在
+SELECT column_name FROM information_schema.columns 
+WHERE table_catalog = current_database() AND table_name = 'memo';
+
+-- 检查索引是否存在
+SELECT indexname FROM pg_indexes WHERE tablename = 'memo';
+
+-- 查看当前 system_setting 中的 BASIC 记录
+SELECT name, value FROM system_setting WHERE name = 'BASIC';
+```
+
+---
+
+**步骤 2: 备份当前状态（关键！）**
+
+在修改前先备份 `system_setting` 表：
+
+**SQLite**:
+```sql
+-- 导出备份（在 shell 中执行）
+sqlite3 memos_prod.db ".dump system_setting" > backup_system_setting.sql
+
+-- 或创建备份表
+CREATE TABLE system_setting_backup AS SELECT * FROM system_setting;
+```
+
+**MySQL**:
+```sql
+-- 创建备份表
+CREATE TABLE `system_setting_backup` AS SELECT * FROM `system_setting`;
+
+-- 或使用 mysqldump（在 shell 中执行）
+mysqldump -u user -p memos_db system_setting > backup_system_setting.sql
+```
+
+**PostgreSQL**:
+```sql
+-- 创建备份表
+CREATE TABLE system_setting_backup AS SELECT * FROM system_setting;
+
+-- 或使用 pg_dump（在 shell 中执行）
+pg_dump -h localhost -U user -t system_setting memos_db > backup_system_setting.sql
+```
+
+---
+
+**步骤 3: 手动更新 schema_version**
+
+> **注意**: 将下方 SQL 中的 `'0.28.0'` 替换为你的实际目标版本号。
+
+**SQLite (使用 json_set)**:
+```sql
+-- 方式 1: 使用 json_set 函数（推荐，安全）
 UPDATE system_setting 
 SET value = json_set(value, '$.schemaVersion', '0.28.0')
 WHERE name = 'BASIC';
 
--- MySQL:
+-- 方式 2: 如果 json_set 不可用（旧版本 SQLite），手动拼接 JSON
+-- 先查看当前 value 的格式
+SELECT value FROM system_setting WHERE name = 'BASIC';
+-- 假设返回: {"schemaVersion":"0.27.0","secretKey":"abc123"}
+-- 手动更新为（注意引号正确）：
 UPDATE system_setting 
-SET value = JSON_SET(value, '$.schemaVersion', '0.28.0')
+SET value = '{"schemaVersion":"0.28.0","secretKey":"abc123"}'
 WHERE name = 'BASIC';
 ```
 
-**步骤 3: 重启服务**
+**MySQL (使用 JSON_SET)**:
+```sql
+-- MySQL JSON 函数名是大写的，表名和列名需要反引号
+UPDATE `system_setting` 
+SET `value` = JSON_SET(`value`, '$.schemaVersion', '0.28.0')
+WHERE `name` = 'BASIC';
+
+-- 验证: JSON_EXTRACT 可以提取字段验证
+SELECT JSON_EXTRACT(`value`, '$.schemaVersion') 
+FROM `system_setting` WHERE `name` = 'BASIC';
+```
+
+**PostgreSQL (使用 jsonb_set)**:
+```sql
+-- PostgreSQL 使用 jsonb 类型和 jsonb_set 函数
+-- 注意: 路径是数组格式 '{schemaVersion}'，不是 '$.schemaVersion'
+
+-- 方式 1: 使用 jsonb_set（推荐）
+UPDATE system_setting 
+SET value = jsonb_set(
+    value::jsonb,                    -- 转换为 jsonb 类型
+    '{schemaVersion}',               -- 路径数组
+    to_jsonb('0.28.0'::text),        -- 新值
+    true                             -- 不存在则创建
+)::text                             -- 转回 text
+WHERE name = 'BASIC';
+
+-- 方式 2: 如果 value 已经是 jsonb 类型（简化版）
+UPDATE system_setting 
+SET value = jsonb_set(value, '{schemaVersion}', '"0.28.0"', true)
+WHERE name = 'BASIC';
+
+-- 方式 3: 手动构造（复杂但最可靠）
+-- 先查看当前值
+SELECT value FROM system_setting WHERE name = 'BASIC';
+-- 假设返回: {"schemaVersion":"0.27.0","secretKey":"abc123"}
+-- 手动更新：
+UPDATE system_setting 
+SET value = '{"schemaVersion":"0.28.0","secretKey":"abc123"}'
+WHERE name = 'BASIC';
+```
+
+---
+
+**步骤 4: 验证更新结果**
+
+**SQLite**:
+```sql
+-- 验证 1: 直接查询
+SELECT value FROM system_setting WHERE name = 'BASIC';
+
+-- 验证 2: 提取 JSON 字段
+SELECT json_extract(value, '$.schemaVersion') AS schema_version
+FROM system_setting WHERE name = 'BASIC';
+```
+
+**MySQL**:
+```sql
+-- 验证 1: 直接查询
+SELECT `value` FROM `system_setting` WHERE `name` = 'BASIC';
+
+-- 验证 2: 提取 JSON 字段
+SELECT JSON_EXTRACT(`value`, '$.schemaVersion') AS schema_version
+FROM `system_setting` WHERE `name` = 'BASIC';
+
+-- 验证 3: 去掉引号
+SELECT JSON_UNQUOTE(JSON_EXTRACT(`value`, '$.schemaVersion')) AS schema_version
+FROM `system_setting` WHERE `name` = 'BASIC';
+```
+
+**PostgreSQL**:
+```sql
+-- 验证 1: 直接查询
+SELECT value FROM system_setting WHERE name = 'BASIC';
+
+-- 验证 2: 提取 JSON 字段（->> 返回文本）
+SELECT value::jsonb ->> 'schemaVersion' AS schema_version
+FROM system_setting WHERE name = 'BASIC';
+
+-- 验证 3: 使用 json_extract_path_text
+SELECT json_extract_path_text(value::jsonb, 'schemaVersion') AS schema_version
+FROM system_setting WHERE name = 'BASIC';
+```
+
+---
+
+**步骤 5: 回滚处理（如需要）**
+
+如果更新出错，可以从备份恢复：
+
+**SQLite**:
+```sql
+-- 从备份表恢复
+INSERT OR REPLACE INTO system_setting (name, value, description)
+SELECT name, value, description FROM system_setting_backup;
+
+-- 或从 SQL 文件恢复（shell 中）
+sqlite3 memos_prod.db < backup_system_setting.sql
+```
+
+**MySQL**:
+```sql
+-- 从备份表恢复
+REPLACE INTO `system_setting` (`name`, `value`, `description`)
+SELECT `name`, `value`, `description` FROM `system_setting_backup`;
+
+-- 或删除备份表（确认恢复成功后）
+DROP TABLE `system_setting_backup`;
+```
+
+**PostgreSQL**:
+```sql
+-- 从备份表恢复
+INSERT INTO system_setting (name, value, description)
+SELECT name, value, description FROM system_setting_backup
+ON CONFLICT (name) DO UPDATE 
+SET value = EXCLUDED.value, description = EXCLUDED.description;
+
+-- 或删除备份表（确认恢复成功后）
+DROP TABLE system_setting_backup;
+```
+
+---
+
+**步骤 6: 重启服务**
+
+验证 `schema_version` 已正确更新后，重启 Memos 服务：
+
+```bash
+# Docker 环境
+docker restart memos
+
+# systemd 环境
+sudo systemctl restart memos
+
+# 手动运行
+./memos --port 5230
+```
+
+---
+
+**三数据库 JSON 语法对比速查表**
+
+| 操作 | SQLite | MySQL | PostgreSQL |
+|------|--------|-------|------------|
+| **设置 JSON 字段** | `json_set(col, '$.key', val)` | `JSON_SET(col, '$.key', val)` | `jsonb_set(col::jsonb, '{key}', to_jsonb(val), true)` |
+| **提取 JSON 字段** | `json_extract(col, '$.key')` | `JSON_EXTRACT(col, '$.key')` | `col::jsonb ->> 'key'` |
+| **路径格式** | `'$.field'` | `'$.field'` | `'{field}'` 数组格式 |
+| **类型转换** | 无需 | `JSON_UNQUOTE()` 去引号 | `::jsonb` 或 `::text` |
+| **标识符** | 双引号或无 | 反引号 `` ` `` | 双引号（通常不用） |
+
+---
+
+**常见错误排查**
+
+| 错误信息 | 原因 | 解决方案 |
+|----------|------|----------|
+| `no such function: json_set` | SQLite 版本 < 3.9.0 | 用手动字符串替换方式 |
+| `no such function: JSON_SET` | MySQL 版本 < 5.7 | 手动拼接 JSON 字符串 |
+| `function jsonb_set(unknown, unknown, unknown) does not exist` | 缺少类型转换 | 加上 `::jsonb` 类型转换 |
+| `duplicate column name` | 迁移脚本被重复执行 | 确认 schema 已变更后手动更新 version |
+| `column "value" does not exist` | PostgreSQL 表结构不同 | 检查表结构，使用正确的列名 |
 
 ## 3. 存储抽象层设计
 
