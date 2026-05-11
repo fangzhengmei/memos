@@ -94,11 +94,41 @@ query := `SELECT ` + strings.Join(fields, ", ") + `
 "CASE WHEN `parent_memo`.`uid` IS NOT NULL THEN `parent_memo`.`uid` ELSE NULL END AS `parent_uid`",
 ```
 
-**查询优化**：
-- `ExcludeComments: true` 时过滤评论
-  - SQLite: `WHERE parent_uid IS NULL` (`store/db/sqlite/memo.go:104-106`)
-  - MySQL: `HAVING parent_uid IS NULL` (`store/db/mysql/memo.go:112-114`)
-  - PostgreSQL: `WHERE memo_relation.related_memo_id IS NULL` (`store/db/postgres/memo.go:97-99`)
+**关键理解**：`parent_uid` 的值完全由 JOIN 结果决定：
+- 如果 memo 有 `COMMENT` 关系（即该 memo 是某条评论）→ `parent_uid` = 父 memo 的 uid
+- 如果 memo 没有 `COMMENT` 关系 → `parent_uid` = NULL
+
+**ExcludeComments 的过滤行为**：
+三个数据库驱动的实现虽然语法不同，但**逻辑等价**：
+
+| 数据库 | 过滤条件 | 实际含义 |
+|-------|---------|---------|
+| SQLite | `WHERE parent_uid IS NULL` | 过滤出 `parent_memo.uid` 为 NULL 的记录 |
+| MySQL | `HAVING parent_uid IS NULL` | 过滤出计算字段 `parent_uid` 为 NULL 的记录 |
+| PostgreSQL | `WHERE memo_relation.related_memo_id IS NULL` | 过滤出 `memo_relation` JOIN 失败的记录 |
+
+**三种方式的等价性**：
+```
+LEFT JOIN memo_relation ON memo.id = memo_relation.memo_id AND memo_relation.type = 'COMMENT'
+LEFT JOIN memo AS parent_memo ON memo_relation.related_memo_id = parent_memo.id
+```
+
+如果某个 memo **不是评论**（没有 COMMENT 关系作为源）：
+- `memo_relation.related_memo_id` → NULL
+- `parent_memo.uid` → NULL
+- `parent_uid` → NULL
+
+如果某个 memo **是评论**（有 COMMENT 关系作为源）：
+- `memo_relation.related_memo_id` → 父 memo 的 ID
+- `parent_memo.uid` → 父 memo 的 UID
+- `parent_uid` → 父 memo 的 UID
+
+**结论**：`ExcludeComments` 保留所有 `parent_uid IS NULL` 的记录，包括：
+1. **普通 memo**（从未是评论）
+2. **孤儿评论**（曾是评论，但关系边已被删除）
+3. **孤儿引用**（曾有引用关系，现在没有了）
+
+孤儿评论会被当作普通 memo 一样保留在查询结果中。
 
 ### 3.3 评论创建流程 (`server/router/api/v1/memo_service.go:654-757`)
 
@@ -742,11 +772,12 @@ DeleteMemo (API层)
 |---------|------|---------|
 | `store/memo_relation.go` | MemoRelation 结构体和 Store 接口 | 关系类型定义、查询条件结构体 |
 | `store/memo.go` | Memo 结构体和 DeleteMemo 级联清理 | Store层 DeleteMemo 的通用关系清理 |
+| `store/user_delete.go` | DeleteUserCompletely 实现 | 递归图遍历收集 memo 树、批量删除 |
 | `store/db/sqlite/memo_relation.go` | SQLite 关系表 CRUD 实现 | Upsert/List/Delete 的 SQL 实现 |
 | `store/db/sqlite/memo.go` | SQLite memo 查询 | ParentUID 实时 JOIN 计算、ExcludeComments 过滤 |
 | `store/db/mysql/memo.go` | MySQL memo 查询 | ParentUID 实时 JOIN 计算（HAVING 过滤） |
 | `store/db/postgres/memo.go` | PostgreSQL memo 查询 | ParentUID 实时 JOIN 计算 |
-| `server/router/api/v1/memo_service.go` | CreateMemoComment, DeleteMemo, UpdateMemo | 评论创建、级联删除、关系更新入口 |
+| `server/router/api/v1/memo_service.go` | CreateMemoComment, DeleteMemo, UpdateMemo | 评论创建、级联删除（只删直接评论）、关系更新入口 |
 | `server/router/api/v1/memo_relation_service.go` | SetMemoRelations, ListMemoRelations | 引用关系全量替换、双向关系查询 |
 | `server/router/api/v1/memo_service_converter.go` | batchConvertMemoRelations | 批量关系转换（性能优化） |
 | `proto/api/v1/memo_service.proto` | API 协议定义 | gRPC 接口定义 |
@@ -754,6 +785,14 @@ DeleteMemo (API层)
 | `server/router/mcp/tools_relation.go` | MCP 关系工具 | AI 助手可调用的关系操作 |
 
 ## 10. 修订记录
+
+- **v3 (2026-05-11)**：深入分析删除环节的嵌套评论处理
+  - 新增 **5.3 两条删除路径的嵌套评论处理差异** 章节
+  - 详细分析 `DeleteMemo` 只清理直接评论、嵌套评论可能残留的问题
+  - 详细分析 `DeleteUserCompletely` 递归图遍历（WITH RECURSIVE / BFS）无残留的实现
+  - 对比两条路径的收集策略、事务、删除顺序等维度
+  - 说明孤儿评论的特征和检测方法
+  - 补充 `store/user_delete.go` 到文件索引
 
 - **v2 (2026-05-11)**：重新审视关系维护链路
   - 修正 ParentUID 机制：明确为**实时 JOIN 计算**，非缓存字段
