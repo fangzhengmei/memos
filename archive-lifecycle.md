@@ -552,63 +552,114 @@ case SSE_EVENT_TYPES.memoDeleted:
 
 #### 5.5.3 多级评论关系的删除残留风险与可见性分析
 
-**场景假设**：
-
-```
-Memo A (父 memo, 正常状态)
-    ├── Memo B (评论 A)  ← 直接评论，有 relation (B, A, COMMENT)
-    │       └── Memo C (评论 B)  ← 评论的评论，有 relation (C, B, COMMENT)
-    │
-    └── Memo D (评论 A)  ← 直接评论，有 relation (D, A, COMMENT)
-```
-
-**关系表记录**：
-
-| memo_id | related_memo_id | type |
-|---------|----------------|------|
-| B | A | COMMENT |
-| C | B | COMMENT |
-| D | A | COMMENT |
-
-**删除 Memo A 时的实际执行**：
-
-1. 列出直接评论：`related_memo_id = A` → 找到 B 和 D
-2. 调用 `Store.DeleteMemo(B)`：
-   - 删除关系：`memo_id = B` → 删除 (B, A, COMMENT)
-   - 删除关系：`related_memo_id = B` → 删除 (C, B, COMMENT)
-   - 删除 Memo B 本体
-   - **关键**：Memo C 的关系被清理了，但 Memo C 本体呢？
-   
-3. 调用 `Store.DeleteMemo(D)`：
-   - 同上，删除 D 及其关系
-
-4. 调用 `Store.DeleteMemo(A)`：
-   - 删除关系：`memo_id = A`（如果 A 有作为评论的关系）
-   - 删除关系：`related_memo_id = A`（但 B 和 D 的关系已经删了）
-   - 删除 Memo A 本体
-
-**关键问题**：`Store.DeleteMemo(B)` 会删除哪些数据？
+**Store.DeleteMemo 的关系清理规则（关键理解）**：
 
 位置：`store/memo.go:140-159`
 
 ```go
 func (s *Store) DeleteMemo(ctx context.Context, delete *DeleteMemo) error {
-    // 1. 删除 memo_id = delete.ID 的关系
-    //    → 删除 B 作为源的关系：(B, A, COMMENT)
+    // 规则 1：删除该 memo 作为源的关系（memo_id = delete.ID）
+    //    → 删除"我评论别人"的关系
     if err := s.driver.DeleteMemoRelation(ctx, &DeleteMemoRelation{MemoID: &delete.ID}); err != nil {
         return err
     }
-    // 2. 删除 related_memo_id = delete.ID 的关系
-    //    → 删除 B 作为目标的关系：(C, B, COMMENT)
-    //    ⚠️ 这个会删除 C→B 的关系，但不会删除 Memo C 本体！
+    // 规则 2：删除该 memo 作为目标的关系（related_memo_id = delete.ID）
+    //    → 删除"别人评论我"的关系
     if err := s.driver.DeleteMemoRelation(ctx, &DeleteMemoRelation{RelatedMemoID: &delete.ID}); err != nil {
         return err
     }
-    // 3. 清理 B 的 attachments
-    // 4. 删除 B 本体
+    // 清理 attachments，删除 memo 本体
     return s.driver.DeleteMemo(ctx, delete)
 }
 ```
+
+**场景假设（四级评论）**：
+
+```
+Memo A (主 memo, 正常状态)
+    ├── Memo B (评论 A)  ← 直接评论，relation = (B, A, COMMENT)
+    │       └── Memo C (评论 B)  ← 评论的评论，relation = (C, B, COMMENT)
+    │               └── Memo D (评论 C)  ← 评论的评论的评论，relation = (D, C, COMMENT)
+    │
+    └── Memo E (评论 A)  ← 直接评论，relation = (E, A, COMMENT)
+```
+
+**初始关系表**：
+
+| memo_id | related_memo_id | type | 含义 |
+|---------|----------------|------|------|
+| B | A | COMMENT | B 评论 A |
+| C | B | COMMENT | C 评论 B |
+| D | C | COMMENT | D 评论 C |
+| E | A | COMMENT | E 评论 A |
+
+---
+
+**删除 Memo A 时的实际执行推演**：
+
+**步骤 1**：API.DeleteMemo(A) 列出直接评论
+- 查询 `ListMemoRelations(RelatedMemoID = A, Type = COMMENT)`
+- 找到关系 (B, A, COMMENT) 和 (E, A, COMMENT)
+- 对应直接评论：B 和 E
+
+**步骤 2**：调用 `Store.DeleteMemo(B)`（删除直接评论 B）
+
+根据清理规则：
+- 规则 1：删除 `memo_id = B` 的关系 → 删除 **(B, A, COMMENT)**（B 评论 A）
+- 规则 2：删除 `related_memo_id = B` 的关系 → 删除 **(C, B, COMMENT)**（C 评论 B）⚠️
+- 删除 B 的 attachments
+- 删除 B 本体
+
+**此时状态**：
+- B 已删除
+- 关系 (B, A, COMMENT) 已删
+- 关系 (C, B, COMMENT) **已被删除**（因为 B 作为目标）
+- **但 C 本体未被删除！** API 层只处理直接评论 B，不会递归处理 C
+
+**步骤 3**：调用 `Store.DeleteMemo(E)`（删除直接评论 E）
+
+根据清理规则：
+- 规则 1：删除 `memo_id = E` 的关系 → 删除 **(E, A, COMMENT)**（E 评论 A）
+- 规则 2：删除 `related_memo_id = E` 的关系 → 无（没有 memo 评论 E）
+- 删除 E 的 attachments
+- 删除 E 本体
+
+**此时状态**：
+- E 已删除
+- 关系 (E, A, COMMENT) 已删
+
+**步骤 4**：调用 `Store.DeleteMemo(A)`（删除主 memo A）
+
+根据清理规则：
+- 规则 1：删除 `memo_id = A` 的关系 → 无（A 没有评论其他 memo）
+- 规则 2：删除 `related_memo_id = A` 的关系 → (B,A) 和 (E,A) 已被 B、E 的删除清理
+- 删除 A 的 attachments
+- 删除 A 本体
+
+---
+
+**最终状态汇总**：
+
+| Memo | 本体状态 | 原因 |
+|------|---------|------|
+| A | ✅ 已删除 | 主 memo，被 API.DeleteMemo(A) 处理 |
+| B | ✅ 已删除 | 直接评论，被 Store.DeleteMemo(B) 处理 |
+| C | ❌ **残留** | 评论的评论，API 层不递归处理，未被调用 Store.DeleteMemo(C) |
+| D | ❌ **残留** | 更深层级评论，同上 |
+| E | ✅ 已删除 | 直接评论，被 Store.DeleteMemo(E) 处理 |
+
+**最终关系表**：
+
+| memo_id | related_memo_id | type | 是否保留 | 原因 |
+|---------|----------------|------|---------|------|
+| (B, A, COMMENT) | - | - | ❌ 已删 | Store.DeleteMemo(B) 规则 1 |
+| (C, B, COMMENT) | - | - | ❌ 已删 | Store.DeleteMemo(B) 规则 2（B 作为目标） |
+| (D, C, COMMENT) | - | - | ✅ **保留** | C 未被删除，没有人清理这个关系 |
+| (E, A, COMMENT) | - | - | ❌ 已删 | Store.DeleteMemo(E) 规则 1 |
+
+**关键差异**：
+- **C 的关系 (C, B, COMMENT)**：已删除，因为 B 被删除时触发了规则 2（清理"别人评论我"的关系）
+- **D 的关系 (D, C, COMMENT)**：**保留**，因为 C 没有被删除，没人触发规则 2 来清理这个关系
 
 ---
 
