@@ -329,6 +329,192 @@ func (s *Store) DeleteMemo(ctx context.Context, delete *DeleteMemo) error {
 | Store层 `DeleteMemo` | 通用清理 | 清理该 memo 作为源或目标的**所有关系**（不分类型）+ 附件 |
 | DB Driver层 | SQL 执行 | 执行具体的 DELETE 语句 |
 
+### 5.3 两条删除路径的嵌套评论处理差异
+
+#### 5.3.1 场景说明：嵌套评论的结构
+
+假设有以下嵌套评论结构：
+
+```
+Memo A (原笔记)
+    ├── Comment B (直接评论 A)
+    │       └── Comment C (评论 B，即 A 的孙子评论)
+    └── Comment D (直接评论 A)
+```
+
+关系表中的记录：
+```
+memo_relation:
+  (memo_id=B, related_memo_id=A, type='COMMENT')
+  (memo_id=C, related_memo_id=B, type='COMMENT')
+  (memo_id=D, related_memo_id=A, type='COMMENT')
+```
+
+#### 5.3.2 DeleteMemo 的行为：只清理直接评论，可能残留嵌套评论
+
+**API 层 DeleteMemo** (`server/router/api/v1/memo_service.go:626-641`)：
+
+```go
+// 第一步：只查询直接评论（RelatedMemoID = 当前 memo）
+commentType := store.MemoRelationComment
+relations, err := s.Store.ListMemoRelations(ctx, &store.FindMemoRelation{
+    RelatedMemoID: &memo.ID,  // 只找目标是当前 memo 的关系
+    Type:           &commentType,
+})
+// 只遍历直接评论 B 和 D
+for _, relation := range relations {
+    // 调用 Store.DeleteMemo 删除 B 和 D
+    if err := s.Store.DeleteMemo(ctx, &store.DeleteMemo{ID: relation.MemoID}); err != nil {
+        // ...
+    }
+}
+```
+
+**Store 层 DeleteMemo** (`store/memo.go:140-158`) 删除 B 时：
+```go
+// 1. 清理 B 作为源的关系：删除 (B→A) 和 (B 的其他关系)
+// 2. 清理 B 作为目标的关系：删除 (C→B) ← 关键！
+// 3. 删除 B 自身
+```
+
+**最终结果分析**：
+
+| 实体 | DeleteMemo(A) 后的状态 |
+|-----|----------------------|
+| Memo A | 已删除 |
+| Comment B | 已删除（直接级联删除） |
+| Comment D | 已删除（直接级联删除） |
+| Comment C | **memo 记录仍然存在！** ← 关键残留 |
+| 关系 (B→A) | 已删除（B 作为源时清理） |
+| 关系 (C→B) | 已删除（B 作为目标时清理） |
+| 关系 (D→A) | 已删除（D 作为源时清理） |
+
+**残留问题的本质**：
+- Comment C 的**memo 记录**没有被删除
+- 但 Comment C 的**关系边** (C→B) 被删除了（因为 B 被删除时清理了作为目标的关系）
+- Comment C 变成了**孤儿评论**：存在于 memo 表中，但没有任何关系边指向它
+
+**为什么会这样**：
+- API 层的循环只遍历了 `RelatedMemoID = A` 的关系，即直接评论 B 和 D
+- Comment C 的关系是 `(memo_id=C, related_memo_id=B, type='COMMENT')`，所以不会被这个查询选中
+- 当 B 被删除时，Store 层清理了 `related_memo_id = B` 的关系，删除了 (C→B)，但 C 的 memo 记录本身还在
+
+#### 5.3.3 DeleteUserCompletely 的行为：递归收集，无残留
+
+**DeleteUserCompletely** (`store/user_delete.go:53-90`) 使用**递归树遍历**收集所有 memo：
+
+```
+DeleteUserCompletely 流程：
+1. 开启事务
+2. collectDeleteUserTargets
+   └── listDeleteUserMemoTree (递归收集)
+3. deleteUserTargetsTx (批量删除)
+4. 提交事务
+```
+
+**递归收集的核心实现** (`store/user_delete.go:181-218`)：
+
+**SQLite / PostgreSQL**（使用 `WITH RECURSIVE`）：
+```sql
+WITH RECURSIVE memo_tree(id, uid) AS (
+    -- 根节点：用户创建的所有 memo
+    SELECT id, uid
+    FROM memo
+    WHERE creator_id = $1
+    
+    UNION
+    
+    -- 递归子节点：所有评论这些 memo 的评论（包括嵌套评论）
+    SELECT child.id, child.uid
+    FROM memo child
+    JOIN memo_relation rel ON rel.memo_id = child.id AND rel.type = 'COMMENT'
+    JOIN memo_tree parent ON rel.related_memo_id = parent.id
+)
+SELECT id, uid FROM memo_tree
+```
+
+**MySQL**（使用迭代 BFS，因为 MySQL 8.0+ 虽然支持 CTE，但代码使用了迭代方式）(`store/user_delete.go:220-268`)：
+```go
+// 1. 收集根节点：用户创建的所有 memo
+roots = SELECT id FROM memo WHERE creator_id = ?
+
+// 2. BFS 迭代收集所有子孙评论
+for frontier not empty:
+    children = SELECT child.id FROM memo child
+               JOIN memo_relation rel ON rel.memo_id = child.id AND rel.type = 'COMMENT'
+               WHERE rel.related_memo_id IN (frontier)
+    frontier = children
+```
+
+**最终结果分析**：
+
+对于用户创建了 Memo A 的场景：
+- 根节点：A
+- 第一层子节点：B, D（直接评论 A）
+- 第二层子节点：C（评论 B）
+- 收集到的完整集合：{A, B, C, D}
+
+| 实体 | DeleteUserCompletely 后的状态 |
+|-----|-----------------------------|
+| Memo A | 已删除 |
+| Comment B | 已删除 |
+| Comment D | 已删除 |
+| Comment C | 已删除（递归收集到） |
+| 所有关系 | 已删除（批量删除） |
+
+**无残留的原因**：
+- 使用**图遍历**（CTE 递归或 BFS）收集所有可到达的节点
+- 在**同一个事务**中批量删除所有收集到的 memo 和关系
+- 不需要依赖"删除父节点时自动级联删除子节点"的逻辑
+
+#### 5.3.4 两条路径的详细对比
+
+| 维度 | DeleteMemo (删除单个 memo) | DeleteUserCompletely (删除用户) |
+|-----|---------------------------|--------------------------------|
+| **位置** | `server/router/api/v1/memo_service.go` + `store/memo.go` | `store/user_delete.go` |
+| **收集策略** | 只查询 `RelatedMemoID = 目标` 的直接关系 | 递归图遍历（WITH RECURSIVE 或 BFS） |
+| **嵌套评论处理** | **不处理**：只删除直接评论，嵌套评论的 memo 记录残留 | **完全处理**：递归收集所有子孙评论 |
+| **残留风险** | 有：嵌套评论变成孤儿（memo 记录存在，但关系边被删除） | 无：一次性清理所有相关数据 |
+| **事务** | 无事务（或每个 Store 调用独立事务） | 单一大事务，原子性删除 |
+| **删除顺序** | API层先删评论 memo → Store层清理关系 → 删除自身 | 先收集所有目标 → 批量删除关系 → 批量删除 memo |
+| **数据库支持** | 所有数据库行为一致 | MySQL 使用 BFS，SQLite/PostgreSQL 使用 CTE |
+
+#### 5.3.5 残留数据的表现形式
+
+**孤儿评论的特征**：
+- 存在于 `memo` 表中（creator_id、content 等字段完整）
+- 但在 `memo_relation` 表中**没有任何 `type='COMMENT'` 的关系**
+- 通过 `ExcludeComments` 过滤时不会出现（因为 ParentUID 为 NULL）
+- 查询该 memo 时，`ParentUID` 为 NULL（因为 JOIN 不到 parent_memo）
+- 实际上变成了一个**普通 memo**，但内容是评论
+
+**如何检测孤儿评论**：
+```sql
+-- 找出所有 memo 表中存在，但没有 COMMENT 关系边的"评论"
+-- （假设评论的 visibility 可能是特定值，或者通过其他方式判断）
+SELECT m.id, m.uid, m.content
+FROM memo m
+LEFT JOIN memo_relation mr ON m.id = mr.memo_id AND mr.type = 'COMMENT'
+WHERE mr.memo_id IS NULL;
+```
+
+#### 5.3.6 设计意图与权衡
+
+**DeleteMemo 的设计意图**：
+- 简单直接：删除一个 memo，同时删除它的直接评论
+- 假设：用户不会有深层嵌套的评论，或者残留不是严重问题
+- 性能：避免递归查询的开销
+
+**DeleteUserCompletely 的设计意图**：
+- 彻底清理：用户注销时需要完全删除所有数据
+- 合规要求：GDPR 等法规要求"被遗忘权"
+- 使用图遍历确保没有遗漏
+
+**可能的改进方向**：
+- 让 DeleteMemo 也使用递归方式收集所有子孙评论
+- 或者在 Store 层实现级联删除触发器
+- 但这会增加复杂度和性能开销
+
 #### 5.2.4 查询环节
 
 **查询 memo 时的 ParentUID 计算**：
