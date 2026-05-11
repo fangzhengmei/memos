@@ -213,7 +213,10 @@ LIMIT 21 OFFSET 0
 ORDER BY `pinned` DESC, `created_ts` DESC, `id` DESC
 ```
 - 无复合索引覆盖这些排序字段
-- 数据库需要执行 `filesort`（文件排序）
+- 在无匹配复合索引时，三种数据库都需要显式排序步骤，但执行计划术语不同：
+  - SQLite：`USE TEMP B-TREE FOR ORDER BY`（`EXPLAIN QUERY PLAN`）
+  - MySQL：`Using filesort`（`EXPLAIN` 的 `Extra` 列）
+  - PostgreSQL：`Sort` 节点（`EXPLAIN`）
 
 ### 4.3 索引参与总结
 
@@ -231,8 +234,8 @@ Filter 层：CEL 编译 → 渲染为 SQL（包含 LIKE、json_extract、OR）
   │   ├── json_extract() ──→ 无法使用索引
   │   ├── OR 条件 ──→ 可能阻止索引使用
   │   └── 普通等值 ──→ 无对应索引
-  ├── ORDER BY：无复合索引 ──→ filesort
-  └── 执行策略：全表扫描 + filesort
+  ├── ORDER BY：无复合索引 ──→ 触发显式排序步骤
+  └── 执行策略：扫描（SQLite: SCAN / MySQL: type=ALL / PostgreSQL: Seq Scan）+ 显式排序（SQLite: TEMP B-TREE / MySQL: 排序操作 / PostgreSQL: Sort）
 ```
 
 ---
@@ -363,9 +366,8 @@ LEFT JOIN `memo` AS `parent_memo` ON `memo_relation`.`related_memo_id` = `parent
 
 **退化原因**：
 - 多表 JOIN 增加查询复杂度
-- `memo_relation` 表仅有复合唯一约束 `UNIQUE(memo_id, related_memo_id, type)`，无单独的单列索引
-- JOIN 条件 `memo_relation.type = "COMMENT"` 为等值条件，但复合索引中 `type` 是第三个字段，选择性可能不足
-- 需扫描主表后再进行 JOIN，无法通过关联表索引反向查找
+- `memo_relation` 表无索引（除主键外）
+- JOIN 条件可能阻止主表索引使用
 
 **影响范围**：
 - 所有 ListMemos 查询
@@ -390,6 +392,16 @@ if find.OrderByUpdatedTs {
 orderBy = append(orderBy, "`id` DESC")  // tie-breaker
 ```
 
+**各数据库排序实现术语对比**：
+
+| 数据库 | EXPLAIN 中的排序术语 | 说明 |
+|-------|---------------------|------|
+| MySQL | `Using filesort` | 表示需要额外排序，可能是内存排序或文件排序 |
+| PostgreSQL | `Sort` | 执行计划中显示 Sort 节点 |
+| SQLite | `USE TEMP B-TREE` 或隐式排序 | 使用临时 B-Tree 或直接排序 |
+
+**重要说明**：MySQL 的 `filesort` 术语具有误导性——即使数据量较小，排序也可能在内存中进行，不一定涉及文件 I/O。跨数据库的准确表述应为"排序操作"或"无索引支持的排序"。
+
 **生成的 ORDER BY**：
 ```sql
 -- 默认排序
@@ -404,7 +416,7 @@ ORDER BY `pinned` DESC, `updated_ts` DESC, `id` DESC
 
 **退化原因**：
 - 无复合索引 `(pinned, created_ts, id)` 或 `(created_ts, id)`
-- 数据库需要执行 filesort（文件排序）
+- 排序无法由索引直接输出，需走方言对应的显式排序步骤（SQLite: TEMP B-TREE / MySQL: 排序操作 / PostgreSQL: Sort）
 - 即使有单列索引，也无法覆盖多字段排序
 
 **影响范围**：
@@ -448,7 +460,7 @@ UNIX_TIMESTAMP(`memo`.`updated_ts`) AS `updated_ts`,
 
 **实际情况（无索引）**：
 ```
-全表扫描 → 逐行评估 → 全部读取 → filesort → 结果
+扫描（SQLite: SCAN / MySQL: type=ALL / PostgreSQL: Seq Scan）→ 逐行评估 → 显式排序（SQLite: TEMP B-TREE / MySQL: 排序操作 / PostgreSQL: Sort）→ 结果
 时间复杂度：O(n log n)，全表扫描 + 排序
 ```
 
@@ -1061,7 +1073,7 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 │  │  │    AND json_extract(...) LIKE ?  -- 索引退化！                │  │ │
 │  │  │    AND memo.row_status = ?                                   │  │ │
 │  │  │  ORDER BY pinned DESC, created_ts DESC, id DESC              │  │ │
-│  │  │  -- 无复合索引，需要 filesort                                 │  │ │
+│  │  │  -- 无复合索引，需显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort）│  │ │
 │  │  │  LIMIT ? OFFSET ?                                            │  │ │
 │  │  └──────────────────────────────┬───────────────────────────────┘  │ │
 │  └─────────────────────────────────┼──────────────────────────────────┘ │
@@ -1071,8 +1083,8 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
                           ┌─────────────────┐
                           │   数据库引擎     │
                           │  执行计划：       │
-                          │  全表扫描         │
-                          │  + filesort      │
+                          │  扫描（SQLite: SCAN / MySQL: type=ALL / PostgreSQL: Seq Scan） │
+                          │  + 显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort） │
                           └─────────────────┘
 ```
 
@@ -1164,9 +1176,9 @@ LIMIT / OFFSET：
 LIMIT 21 OFFSET 0
 
 执行计划（无索引）：
-  - 全表扫描 memo 表
+  - 扫描 memo 表（SQLite: SCAN；MySQL: type=ALL；PostgreSQL: Seq Scan）
   - 逐行评估 WHERE 条件
-  - filesort 排序结果
+  - 显式排序步骤（SQLite: USE TEMP B-TREE FOR ORDER BY；MySQL: Using filesort；PostgreSQL: Sort）
 ```
 
 ---
@@ -1254,7 +1266,7 @@ if currentUser == nil {
 | JSON 字段查询 | payload.property | 高 | `json_extract` 无法使用索引 |
 | OR 权限条件 | 权限裁剪 | 中 | 可能阻止优化器选择 |
 | 多表 JOIN | 列表查询 | 中 | LEFT JOIN user, memo_relation, memo |
-| 多字段排序 | ORDER BY | 中 | 无复合索引，需要 filesort |
+| 多字段排序 | ORDER BY | 中 | 无复合索引，需显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort） |
 | 分页 | 大 Offset | 中 | 使用 keyset 分页可优化（当前用 offset） |
 
 ### 13.2 缓存策略
@@ -1405,9 +1417,9 @@ Memos 的搜索功能采用了**分层协作**的架构设计：
                            - 无对应索引 ← 全表扫描
                                      ↓
                            ORDER BY：
-                           - 多字段排序 ← 无复合索引，filesort
+                           - 多字段排序 ← 无复合索引，触发显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort）
                                      ↓
-                           执行计划：全表扫描 + filesort
+                           执行计划：扫描（SQLite: SCAN / MySQL: type=ALL / PostgreSQL: Seq Scan）+ 显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort）
 ```
 
 ### 15.3 权限裁剪与排序的协作总结
@@ -1440,7 +1452,7 @@ SQL 执行顺序：
 | CEL 动态查询 | 灵活、安全、跨数据库 | 索引退化、调试困难 |
 | API 层注入权限 | 集中、可测试、透明 | OR 条件可能影响性能 |
 | 删除历史索引 | 写入更快、维护简单 | 查询性能随数据量下降 |
-| 多字段排序 + tie-breaker | 结果稳定、可预测 | 需要 filesort |
+| 多字段排序 + tie-breaker | 结果稳定、可预测 | 无复合索引时需显式排序（SQLite TEMP B-TREE / MySQL filesort / PostgreSQL Sort） |
 
 ### 15.5 适用场景与限制
 
