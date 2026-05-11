@@ -363,8 +363,9 @@ LEFT JOIN `memo` AS `parent_memo` ON `memo_relation`.`related_memo_id` = `parent
 
 **退化原因**：
 - 多表 JOIN 增加查询复杂度
-- `memo_relation` 表无索引（除主键外）
-- JOIN 条件可能阻止主表索引使用
+- `memo_relation` 表仅有复合唯一约束 `UNIQUE(memo_id, related_memo_id, type)`，无单独的单列索引
+- JOIN 条件 `memo_relation.type = "COMMENT"` 为等值条件，但复合索引中 `type` 是第三个字段，选择性可能不足
+- 需扫描主表后再进行 JOIN，无法通过关联表索引反向查找
 
 **影响范围**：
 - 所有 ListMemos 查询
@@ -432,7 +433,7 @@ UNIX_TIMESTAMP(`memo`.`updated_ts`) AS `updated_ts`,
 | JSON 属性 | `has_task_list == true` | `json_extract()` 函数 | 无 | 严重 |
 | 权限 OR | `creator_id == X OR visibility IN (...)` | `(A OR B)` | 无 | 中 |
 | 多字段排序 | `ORDER BY pinned, created_ts, id` | 多字段排序 | 无复合索引 | 中 |
-| 多表 JOIN | `LEFT JOIN user, memo_relation, memo` | 多表连接 | 无外键索引 | 中 |
+| 多表 JOIN | `LEFT JOIN user, memo_relation, memo` | 多表连接 | 仅有复合唯一约束 | 中 |
 | 类型转换 | MySQL `UNIX_TIMESTAMP()` | 函数转换 | 可能阻止 | 轻 |
 
 ### 5.4 索引退化对性能的影响
