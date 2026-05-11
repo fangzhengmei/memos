@@ -348,33 +348,58 @@ if (hasConnectedOnceRef.current) {
 
 ### 4.5 层 3: UI 消费
 
-**文件**: `web/src/components/PagedMemoList/PagedMemoList.tsx:84-149`
+**文件**: `web/src/components/PagedMemoList/PagedMemoList.tsx:33-149`
+
+**两处 `hasNextPage` 门槛的真实实现：
 
 ```typescript
-const PagedMemoList = (props) => {
-  // 1. 获取数据
-  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteMemos({...});
+// ─────────────────────────────────────────────────────────────
+// 门槛 1: 自动获取 Hook (行 33-82)
+// 以下为提炼示例（真实实现 50 行，含定时器、useEffect 等细节已省略）
+// ─────────────────────────────────────────────────────────────
+function useAutoFetchWhenNotScrollable({ hasNextPage, isFetchingNextPage, memoCount, onFetchNext }) {
+  // ... 真实代码含 autoFetchTimeoutRef、isPageScrollable、两个 useEffect ...
 
-  // 2. 扁平化 pages
-  const memos = useMemo(() => 
-    data?.pages.flatMap((page) => page.memos) || [], 
-    [data]
-  );
+  const checkAndFetchIfNeeded = useCallback(async () => {
+    // ... 真实代码有定时器逻辑 ...
 
-  // 3. 无限滚动监听
-  useEffect(() => {
-    const handleScroll = () => {
-      const nearBottom = window.innerHeight + window.scrollY >= 
-        document.body.offsetHeight - 300;
-      if (nearBottom && !isFetchingNextPage) {
-        fetchNextPage();
-      }
-    };
-    window.addEventListener("scroll", handleScroll);
-    return () => window.removeEventListener("scroll", handleScroll);
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
-};
+    // 门槛条件（逐行摘录自真实代码行 58）：
+    const shouldFetch = !isPageScrollable() && hasNextPage && !isFetchingNextPage && memoCount > 0;
+
+    if (shouldFetch) {
+      await onFetchNext();
+    }
+  }, [hasNextPage, isFetchingNextPage, memoCount, isPageScrollable, onFetchNext]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 门槛 2: 手动滚动监听 (行 136-149)
+// 以下为逐行摘录自真实代码（无省略）
+// ─────────────────────────────────────────────────────────────
+useEffect(() => {
+  // 真实代码行 138: 没有下一页直接 return，不监听滚动
+  if (!hasNextPage) return;
+
+  const handleScroll = () => {
+    // 真实代码行 141: 距离底部 300px
+    const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 300;
+    // 真实代码行 142: 且不在请求中
+    if (nearBottom && !isFetchingNextPage) {
+      fetchNextPage();
+    }
+  };
+
+  window.addEventListener("scroll", handleScroll);
+  return () => window.removeEventListener("scroll", handleScroll);
+}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 ```
+
+**真实 `hasNextPage` 门槛总结**（两处实现）：
+
+| 触发方式 | 门槛条件 | 真实代码行 |
+|---------|---------|-----------|
+| **自动获取** | `!isPageScrollable() && hasNextPage && !isFetchingNextPage && memoCount > 0` | 58 |
+| **滚动触发** | `if (!hasNextPage) return;` + `nearBottom && !isFetchingNextPage` | 138 + 142 |
 
 ### 4.6 缓存策略对比
 
