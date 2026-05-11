@@ -46,7 +46,126 @@ type MemoRelation struct {
 
 ---
 
-## 3. 三条操作路径总览
+## 3. 评论判定机制详解
+
+### 3.1 数据库层：ListMemos 的 ExcludeComments 逻辑
+
+位置：`store/db/sqlite/memo.go:139-144`
+
+```sql
+SELECT ..., 
+  CASE WHEN `parent_memo`.`uid` IS NOT NULL THEN `parent_memo`.`uid` ELSE NULL END AS `parent_uid`
+FROM `memo`
+  LEFT JOIN `user` AS `memo_creator` ON `memo`.`creator_id` = `memo_creator`.`id`
+  LEFT JOIN `memo_relation` 
+      ON `memo`.`id` = `memo_relation`.`memo_id` 
+      AND `memo_relation`.`type` = "COMMENT" 
+  LEFT JOIN `memo` AS `parent_memo` 
+      ON `memo_relation`.`related_memo_id` = `parent_memo`.`id`
+WHERE ...
+```
+
+位置：`store/db/sqlite/memo.go:104-106`
+
+```go
+if find.ExcludeComments {
+    where = append(where, "`parent_uid` IS NULL")
+}
+```
+
+**关键理解**：
+
+1. **评论的判定方式**：通过 `memo_relation` 表中是否存在 `type = "COMMENT"` 的关系来判定
+   - 如果 memo 在 `memo_relation` 表中作为 `memo_id` 存在，且 `type = "COMMENT"` → 这是一条评论
+   - `parent_uid` 字段是通过 LEFT JOIN 计算出来的，不是 memo 表的固有字段
+
+2. **ExcludeComments 的过滤条件**：`parent_uid IS NULL`
+   - 只有当 `memo_relation.memo_id = memo.id` 且 `type = "COMMENT"` 时，`parent_uid` 才有值
+   - 如果 `parent_uid IS NULL` → 不是评论（或关系已被删除）
+
+---
+
+### 3.2 API 层：ListMemos 默认排除评论
+
+位置：`server/router/api/v1/memo_service.go:189-193`
+
+```go
+func (s *APIV1Service) ListMemos(ctx context.Context, request *v1pb.ListMemosRequest) (*v1pb.ListMemosResponse, error) {
+    memoFind := &store.FindMemo{
+        ExcludeComments: true,  // 默认排除评论
+    }
+    // ...
+}
+```
+
+**默认行为**：
+- 正常 memo 列表查询默认 `ExcludeComments = true`
+- 只有通过 `ListMemoRelations` 或专门的评论查询才会获取评论
+
+---
+
+### 3.3 前端层：isComment 判定
+
+位置：`web/src/components/MemoActionMenu/MemoActionMenu.tsx:38`
+
+```typescript
+const isComment = Boolean(memo.parent);
+```
+
+位置：`web/src/components/MemoDetailSidebar/MemoDetailSidebar.tsx:51`
+
+```typescript
+const canManageShares = !memo.parent && (...);
+```
+
+**前端判定依据**：
+- `memo.parent` 字段来自 API 返回的 `Memo.parent`
+- 如果 `parent` 有值 → 是评论
+- 如果 `parent` 为空 → 不是评论
+
+---
+
+### 3.4 评论判定完整链路
+
+```
+数据库层                    API 层                      前端层
+    │                          │                          │
+    │ 1. LEFT JOIN memo_relation│                          │
+    │    WHERE type = "COMMENT"│                          │
+    │                          │                          │
+    │ 2. 计算 parent_uid:       │                          │
+    │    - 有关系 → parent_uid  │                          │
+    │      = 被评论 memo 的 UID │                          │
+    │    - 无关系 → parent_uid  │                          │
+    │      = NULL               │                          │
+    │                          │                          │
+    │ 3. ExcludeComments=true   │                          │
+    │    → WHERE parent_uid    │                          │
+    │      IS NULL              │                          │
+    │                          │                          │
+    │ ────────────────────────► │                          │
+    │   返回 memo 列表          │                          │
+    │   parent_uid 非空的被过滤  │                          │
+    │                          │                          │
+    │                          │ 4. loadMemoRelations      │
+    │                          │    构建 Memo.parent       │
+    │                          │    (从 relations 中       │
+    │                          │    提取 COMMENT 类型)     │
+    │                          │                          │
+    │                          │ ───────────────────────► │
+    │                          │   返回 Memo 列表         │
+    │                          │   包含 parent 字段       │
+    │                          │                          │
+    │                          │                          │ 5. isComment =         │
+    │                          │                          │    Boolean(memo.parent)│
+    │                          │                          │    - parent 有值 → 评论 │
+    │                          │                          │    - parent 为空 → 非评 │
+    │                          │                          │                         │
+```
+
+---
+
+## 4. 三条操作路径总览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -97,11 +216,11 @@ type MemoRelation struct {
 
 ---
 
-## 4. 路径 1：正常态直删（硬删除）
+## 5. 路径 1：正常态直删（硬删除）
 
 **路径**：NORMAL → 永久删除
 
-### 4.1 前端触发
+### 5.1 前端触发
 
 位置：`web/src/components/MemoActionMenu/MemoActionMenu.tsx:111-117`
 
@@ -158,7 +277,7 @@ const confirmDeleteMemo = useCallback(async () => {
 
 ---
 
-### 4.2 API 校验
+### 5.2 API 校验
 
 位置：`server/router/api/v1/memo_service.go:577-602`
 
@@ -209,7 +328,7 @@ func (s *APIV1Service) DeleteMemo(ctx context.Context, request *v1pb.DeleteMemoR
 
 ---
 
-### 4.3 Webhook 发送（删除前）
+### 5.3 Webhook 发送（删除前）
 
 位置：`server/router/api/v1/memo_service.go:604-624`
 
@@ -249,7 +368,7 @@ if memoMessage, err := s.convertMemoFromStore(ctx, memo, reactions, attachments,
 
 ---
 
-### 4.4 Store 清理（含评论处理逻辑）
+### 5.4 Store 清理（含评论处理逻辑）
 
 位置：`server/router/api/v1/memo_service.go:626-641`
 
@@ -307,9 +426,9 @@ func (s *Store) DeleteMemo(ctx context.Context, delete *DeleteMemo) error {
 
 ---
 
-### 4.5 评论删除的关键分析
+### 5.5 评论删除的关键分析
 
-#### 4.5.1 仅删除直接评论，非递归
+#### 5.5.1 仅删除直接评论，非递归
 
 **代码分析**：
 
@@ -347,7 +466,7 @@ for _, relation := range relations {
 
 ---
 
-#### 4.5.2 子评论走 Store.DeleteMemo 的链路分析
+#### 5.5.2 子评论走 Store.DeleteMemo 的链路分析
 
 **链路对比**：
 
@@ -431,16 +550,16 @@ case SSE_EVENT_TYPES.memoDeleted:
 
 ---
 
-#### 4.5.3 多级评论关系的删除残留风险
+#### 5.5.3 多级评论关系的删除残留风险与可见性分析
 
 **场景假设**：
 
 ```
-Memo A (父)
-    ├── Comment B (直接评论)
-    │       └── Comment C (评论的评论，多级)
+Memo A (父 memo, 正常状态)
+    ├── Memo B (评论 A)  ← 直接评论，有 relation (B, A, COMMENT)
+    │       └── Memo C (评论 B)  ← 评论的评论，有 relation (C, B, COMMENT)
     │
-    └── Comment D (直接评论)
+    └── Memo D (评论 A)  ← 直接评论，有 relation (D, A, COMMENT)
 ```
 
 **关系表记录**：
@@ -455,15 +574,18 @@ Memo A (父)
 
 1. 列出直接评论：`related_memo_id = A` → 找到 B 和 D
 2. 调用 `Store.DeleteMemo(B)`：
-   - 删除关系：`memo_id = B`（包含 C→B 的关系）
-   - 删除关系：`related_memo_id = B`（也包含 C→B 的关系）
+   - 删除关系：`memo_id = B` → 删除 (B, A, COMMENT)
+   - 删除关系：`related_memo_id = B` → 删除 (C, B, COMMENT)
    - 删除 Memo B 本体
-   - **注意**：Comment C 的关系被清理了，但 Memo C 本体呢？
+   - **关键**：Memo C 的关系被清理了，但 Memo C 本体呢？
    
 3. 调用 `Store.DeleteMemo(D)`：
    - 同上，删除 D 及其关系
 
-4. 删除 Memo A 本体
+4. 调用 `Store.DeleteMemo(A)`：
+   - 删除关系：`memo_id = A`（如果 A 有作为评论的关系）
+   - 删除关系：`related_memo_id = A`（但 B 和 D 的关系已经删了）
+   - 删除 Memo A 本体
 
 **关键问题**：`Store.DeleteMemo(B)` 会删除哪些数据？
 
@@ -472,12 +594,13 @@ Memo A (父)
 ```go
 func (s *Store) DeleteMemo(ctx context.Context, delete *DeleteMemo) error {
     // 1. 删除 memo_id = delete.ID 的关系
-    //    → 删除 B 作为源的关系（B→A）
+    //    → 删除 B 作为源的关系：(B, A, COMMENT)
     if err := s.driver.DeleteMemoRelation(ctx, &DeleteMemoRelation{MemoID: &delete.ID}); err != nil {
         return err
     }
     // 2. 删除 related_memo_id = delete.ID 的关系
-    //    → 删除 B 作为目标的关系（C→B）
+    //    → 删除 B 作为目标的关系：(C, B, COMMENT)
+    //    ⚠️ 这个会删除 C→B 的关系，但不会删除 Memo C 本体！
     if err := s.driver.DeleteMemoRelation(ctx, &DeleteMemoRelation{RelatedMemoID: &delete.ID}); err != nil {
         return err
     }
@@ -487,73 +610,103 @@ func (s *Store) DeleteMemo(ctx context.Context, delete *DeleteMemo) error {
 }
 ```
 
-**结果分析**：
+---
 
-| Memo | 是否被删除 | 关系是否被清理 |
-|------|-----------|---------------|
-| A | ✅ 被删除 | ✅ 已清理 |
-| B | ✅ 被删除（通过 Store.DeleteMemo） | ✅ 已清理 |
-| C | ❌ **残留**（未被调用 Store.DeleteMemo） | ✅ 关系 C→B 已清理 |
-| D | ✅ 被删除（通过 Store.DeleteMemo） | ✅ 已清理 |
+#### 5.5.4 残留 memo C 的可见性分析
 
-**残留风险详细说明**：
+**删除后的状态**：
 
-```
-删除前:
-  Memo A (父)
-    ├── Memo B (评论 A)  ← related_memo_id = A
-    │       └── Memo C (评论 B)  ← related_memo_id = B
-    │
-    └── Memo D (评论 A)  ← related_memo_id = A
+| Memo | memo 本体是否删除 | memo_relation 是否删除 | parent_uid 计算结果 |
+|------|-----------------|---------------------|-------------------|
+| A | ✅ 已删除 | ✅ 已删除 | (已删除) |
+| B | ✅ 已删除 | ✅ (B,A) 已删除 | (已删除) |
+| C | ❌ **残留** | ✅ (C,B) 已删除 | **NULL**（因为关系已删） |
+| D | ✅ 已删除 | ✅ (D,A) 已删除 | (已删除) |
 
-关系表:
-  (B, A, COMMENT)
-  (C, B, COMMENT)
-  (D, A, COMMENT)
+**关键结论**：Memo C 的 `parent_uid = NULL`
 
-删除 A 后:
-  - API 层找到直接评论: B, D
-  - 调用 Store.DeleteMemo(B):
-    → 删除关系 (B, A, COMMENT)
-    → 删除关系 (C, B, COMMENT)  ← 关系被删了
-    → 删除 Memo B 本体
-    → ❌ 但没有递归删除 Memo C！
-  - 调用 Store.DeleteMemo(D):
-    → 删除关系 (D, A, COMMENT)
-    → 删除 Memo D 本体
-  - 调用 Store.DeleteMemo(A):
-    → 删除关系 (A 作为源/目标的)
-    → 删除 Memo A 本体
+这意味着什么？回顾第 3 节的评论判定机制：
 
-最终状态:
-  - Memo A: 已删除
-  - Memo B: 已删除
-  - Memo C: ❌ 残留（变成孤立 memo，没有任何关系）
-  - Memo D: 已删除
-  - 关系表: 空
-
-Memo C 的状态:
-  - row_status = NORMAL（或原来的状态）
-  - 没有任何 memo_relation 关联
-  - 不在任何评论列表中显示（因为没有父关系）
-  - 但在 memo 表中仍然存在
-  - 如果通过直接 URL 访问可能还能看到
+```sql
+-- ListMemos 的查询逻辑
+SELECT ..., 
+  CASE WHEN `parent_memo`.`uid` IS NOT NULL 
+       THEN `parent_memo`.`uid` 
+       ELSE NULL END AS `parent_uid`
+FROM `memo`
+  LEFT JOIN `memo_relation` 
+      ON `memo`.`id` = `memo_relation`.`memo_id` 
+      AND `memo_relation`.`type` = "COMMENT" 
+  LEFT JOIN `memo` AS `parent_memo` 
+      ON `memo_relation`.`related_memo_id` = `parent_memo`.`id`
+WHERE ...
+  AND `parent_uid` IS NULL  -- ExcludeComments = true 时的条件
 ```
 
-**影响范围**：
-
-| 影响方面 | 说明 |
-|---------|------|
-| **数据残留** | 多级评论（评论的评论）会变成孤立 memo 残留在数据库中 |
-| **存储空间** | 残留 memo 的 attachments、payload 等数据占用空间 |
-| **用户体验** | 残留 memo 不会出现在任何列表中，但数据库中存在 |
-| **统计数据** | 残留 memo 可能会被计入用户统计（取决于统计查询逻辑） |
-| **Webhook/SSE** | 残留 memo 的删除不会触发任何事件通知 |
-| **潜在泄露** | 如果残留 memo 有敏感内容，且能通过某种方式访问 |
+**由于 Memo C 的 `memo_relation` 记录已被删除**：
+- LEFT JOIN `memo_relation` 时找不到匹配
+- `parent_uid = NULL`
+- **满足 `parent_uid IS NULL` 的条件**
+- **会被 `ListMemos(ExcludeComments=true)` 返回！**
 
 ---
 
-#### 4.5.4 Store 清理顺序及失败处理
+#### 5.5.5 残留 memo C 的影响范围（修正后的精确结论）
+
+**前提条件**：
+- Memo C 原本是 Memo B 的评论
+- 删除 Memo A 时，Memo B 被删除，C→B 的关系被清理
+- Memo C 本体残留，但关系已丢失
+
+**数据库状态**：
+
+| 字段 | 值 |
+|------|-----|
+| memo.id | C 的 ID |
+| memo.row_status | NORMAL（或原状态） |
+| memo_relation 中 memo_id = C 的记录 | ❌ 已删除 |
+| memo_relation 中 related_memo_id = C 的记录 | 可能有（如果 C 有自己的评论） |
+
+**可见性分析**：
+
+| 查询方式 | 是否可见 | 原因 |
+|---------|---------|------|
+| `ListMemos(ExcludeComments=true)`（默认列表） | **✅ 可见** | `parent_uid = NULL`，满足过滤条件 |
+| `ListMemoRelations`（专门查评论关系） | ❌ 不可见 | 关系已被删除 |
+| 直接访问 `/memos/:uid` | **✅ 可见** | memo 本体还在，GetMemo 不查关系 |
+| 用户统计 `GetUserStats` | **✅ 被计入** | 使用 `ExcludeComments=true`，C 满足条件 |
+| RSS 订阅 | **✅ 可见** | 使用 `ExcludeComments=true` |
+| MCP 工具查询 | **✅ 可见** | 使用 `ExcludeComments=true` |
+
+**用户体验影响**：
+
+1. **残留 memo 突然出现在正常列表中**：
+   - 用户删除 Memo A 后，原本的评论 Memo C 可能出现在首页、时间线等正常 memo 列表中
+   - 因为 C 不再被识别为评论（关系已丢失）
+
+2. **统计数据异常**：
+   - `TotalMemoCount` 会包含残留的评论 memo
+   - `TagCount`、`MemoTypeStats`（LinkCount、CodeCount、TodoCount、UndoCount）都会计入
+   - `MemoCreatedTimestamps`、`MemoUpdatedTimestamps` 也会包含
+
+3. **内容暴露风险**：
+   - 如果 Memo C 原本是评论（可能是对敏感内容的讨论），现在变成"正常 memo"
+   - 可能会被公开访问（如果 visibility = PUBLIC/PROTECTED）
+   - 可能被其他用户在正常列表中看到
+
+**精确的前提条件总结**：
+
+| 条件 | 说明 |
+|------|------|
+| 必须存在多级评论 | 至少三级：A → B → C |
+| 被删除的是顶层 memo | 删除 A 时，B 被删除，C 的关系被清理但本体残留 |
+| 残留 memo 的关系被清理 | Store.DeleteMemo(B) 时删除了 (C, B, COMMENT) 关系 |
+| 残留 memo 本身未被调用 Store.DeleteMemo | API 层只处理直接评论 B 和 D，不递归处理 C |
+| ListMemos 使用 ExcludeComments=true | 默认行为，parent_uid=NULL 时满足条件 |
+
+---
+
+#### 5.5.6 Store 清理顺序及失败处理
 
 | 步骤 | 操作内容 | 失败时 | 失败影响 |
 |------|----------|--------|----------|
@@ -569,10 +722,11 @@ Memo C 的状态:
 - 删除操作**没有事务保护**，是分步执行的
 - 如果中途失败，已删除的数据**不会回滚**
 - 多级评论存在**残留风险**（评论的评论不会被删除）
+- **残留 memo 可能被当成正常 memo 返回**（因为关系被清理，parent_uid=NULL）
 
 ---
 
-### 4.6 SSE 广播（删除后）
+### 5.6 SSE 广播（删除后）
 
 位置：`server/router/api/v1/memo_service.go:643-649`
 
@@ -618,7 +772,7 @@ func (h *SSEHub) Broadcast(event *SSEEvent) {
 
 ---
 
-### 4.7 前端缓存刷新
+### 5.7 前端缓存刷新
 
 位置：`web/src/hooks/useLiveMemoRefresh.ts:390-394`
 
@@ -635,9 +789,11 @@ case SSE_EVENT_TYPES.memoDeleted:
 2. 失效列表缓存（`memoKeys.lists`）
 3. 失效用户统计缓存（`userKeys.stats`）
 
+**注意**：这个失效只会让前端重新查询，但残留的 memo C 会在重新查询时被当作正常 memo 返回。
+
 ---
 
-### 4.8 正常态直删完整时序图
+### 5.8 正常态直删完整时序图
 
 ```
 前端                                    API                                   Store                             Webhook                         SSE
@@ -670,11 +826,14 @@ case SSE_EVENT_TYPES.memoDeleted:
  │                                       │    ├─ Store.DeleteMemo(B)            │ ─────────────────────────────►   │                              │
  │                                       │    │  ├─ DeleteMemoRelation (源)       │                                  │                              │
  │                                       │    │  ├─ DeleteMemoRelation (目标)     │                                  │                              │
+ │                                       │    │  │  ⚠️ 删除 C→B 的关系            │                                  │                              │
  │                                       │    │  ├─ DeleteAttachments             │                                  │                              │
  │                                       │    │  └─ DeleteMemo 本体               │                                  │                              │
  │                                       │    │  ❌ 无 Webhook                    │                                  │                              │
  │                                       │    │  ❌ 无 SSE                        │                                  │                              │
- │                                       │    │  ⚠️ 评论 C 残留                   │                                  │                              │
+ │                                       │    │  ⚠️ Memo C 本体残留               │                                  │                              │
+ │                                       │    │  ⚠️ Memo C 的关系被清理           │                                  │                              │
+ │                                       │    │  ⚠️ Memo C 变成"正常 memo"        │                                  │                              │
  │                                       │    │                                  │                                  │                              │
  │                                       │    └─ Store.DeleteMemo(D)            │ ─────────────────────────────►   │                              │
  │                                       │       同上                           │                                  │                              │
@@ -699,17 +858,20 @@ case SSE_EVENT_TYPES.memoDeleted:
  │ 2. invalidateQueries(lists)           │                                      │                                  │                              │
  │ 3. invalidateQueries(stats)           │                                      │                                  │                              │
  │                                       │                                      │                                  │                              │
+ │ ⚠️ 重新查询列表时，Memo C 会被返回       │                                      │                                  │                              │
+ │    因为 C 的关系已清理，parent_uid=NULL │                                      │                                  │                              │
+ │                                       │                                      │                                  │                              │
  │ 导航到首页                             │                                      │                                  │                              │
  │ 显示成功 Toast                         │                                      │                                  │                              │
 ```
 
 ---
 
-## 5. 路径 2：归档（软删除）
+## 6. 路径 2：归档（软删除）
 
 **路径**：NORMAL → ARCHIVED
 
-### 5.1 前端触发
+### 6.1 前端触发
 
 位置：`web/src/components/MemoActionMenu/MemoActionMenu.tsx:104-109`
 
@@ -775,7 +937,7 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 
 ---
 
-### 5.2 API 校验
+### 6.2 API 校验
 
 位置：`server/router/api/v1/memo_service.go:460-487`
 
@@ -847,7 +1009,7 @@ func (s *APIV1Service) UpdateMemo(ctx context.Context, request *v1pb.UpdateMemoR
 
 ---
 
-### 5.3 Store 更新
+### 6.3 Store 更新
 
 位置：`store/memo.go:133-138`
 
@@ -866,7 +1028,7 @@ func (s *Store) UpdateMemo(ctx context.Context, update *UpdateMemo) error {
 
 ---
 
-### 5.4 Webhook 发送
+### 6.4 Webhook 发送
 
 位置：`server/router/api/v1/memo_service.go:569-572`
 
@@ -901,7 +1063,7 @@ func (s *APIV1Service) dispatchMemoUpdatedSideEffects(ctx context.Context, memo 
 
 ---
 
-### 5.5 SSE 广播
+### 6.5 SSE 广播
 
 位置：`server/router/api/v1/memo_update_helpers.go:71-77`
 
@@ -919,7 +1081,7 @@ s.SSEHub.Broadcast(&SSEEvent{
 
 ---
 
-### 5.6 前端缓存刷新
+### 6.6 前端缓存刷新
 
 位置：`web/src/hooks/useLiveMemoRefresh.ts:382-388`
 
@@ -935,7 +1097,7 @@ case SSE_EVENT_TYPES.memoUpdated:
 
 ---
 
-### 5.7 归档完整时序图
+### 6.7 归档完整时序图
 
 ```
 前端                                    API                                   Store                             Webhook                         SSE
@@ -983,11 +1145,11 @@ case SSE_EVENT_TYPES.memoUpdated:
 
 ---
 
-## 6. 路径 3：归档后恢复
+## 7. 路径 3：归档后恢复
 
 **路径**：ARCHIVED → NORMAL
 
-### 6.1 前端触发
+### 7.1 前端触发
 
 归档页面入口：
 
@@ -1052,7 +1214,7 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 
 ---
 
-### 6.2 API 校验
+### 7.2 API 校验
 
 与归档路径完全相同，使用同一个 `UpdateMemo` 接口。
 
@@ -1062,7 +1224,7 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 
 ---
 
-### 6.3 完整事件流程
+### 7.3 完整事件流程
 
 与归档路径完全一致：
 1. Store.UpdateMemo（ARCHIVED → NORMAL）
@@ -1072,7 +1234,7 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 
 ---
 
-### 6.4 归档后恢复完整时序图
+### 7.4 归档后恢复完整时序图
 
 ```
 前端                                    API                                   Store                             Webhook                         SSE
@@ -1119,11 +1281,11 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 
 ---
 
-## 7. 路径 1（变体）：归档后删除
+## 8. 路径 1（变体）：归档后删除
 
 **路径**：ARCHIVED → 永久删除
 
-### 7.1 与正常态直删的异同
+### 8.1 与正常态直删的异同
 
 **相同点**：
 - 使用完全相同的 `DeleteMemo` 接口
@@ -1137,20 +1299,21 @@ const handleToggleMemoStatusClick = useCallback(async () => {
 - 但代码中不校验状态，所以逻辑完全一致
 - 唯一差异：用户操作入口（归档页 vs 正常列表/详情页）
 
-### 7.2 删除流程
+### 8.2 删除流程
 
-与"路径 1：正常态直删"完全相同，详见第 4 节。
+与"路径 1：正常态直删"完全相同，详见第 5 节。
 
 **注意**：
 - 归档 memo 的评论删除逻辑与正常 memo 相同
 - 同样存在多级评论残留风险
 - 同样不会触发子评论的 Webhook 和 SSE
+- 同样可能将残留 memo 当成正常 memo 返回
 
 ---
 
-## 8. 评论删除链路深度分析
+## 9. 评论删除链路深度分析
 
-### 8.1 评论关系模型
+### 9.1 评论关系模型
 
 位置：`store/memo_relation.go:16-20`
 
@@ -1172,7 +1335,9 @@ Memo A (父)
   └── Memo D (评论 A): relation = (D, A, COMMENT)
 ```
 
-### 8.2 删除父 memo 时的执行路径
+---
+
+### 9.2 删除父 memo 时的执行路径
 
 ```
 API.DeleteMemo(A)
@@ -1194,6 +1359,7 @@ API.DeleteMemo(A)
     │   └── ❌ 没有 DispatchMemoDeletedWebhook(B)
     │   └── ❌ 没有 SSEHub.Broadcast(memo.deleted, B)
     │   └── ⚠️ Memo C 本体残留（只删除了关系，没删 memo）
+    │   └── ⚠️ Memo C 的 parent_uid = NULL（被当成正常 memo）
     │
     ├── Store.DeleteMemo(D)
     │   └── 同上，D 被删除，没有事件
@@ -1203,7 +1369,9 @@ API.DeleteMemo(A)
     └── ✅ SSEHub.Broadcast(memo.deleted, A)
 ```
 
-### 8.3 事件传播对比表
+---
+
+### 9.3 事件传播对比表
 
 | 项目 | 父 memo（API 层） | 直接子评论（Store 层） | 评论的评论（多级） |
 |------|-----------------|---------------------|------------------|
@@ -1213,17 +1381,20 @@ API.DeleteMemo(A)
 | **memo 本体** | ✅ 被删除 | ✅ 被删除 | ❌ 残留 |
 | **relations** | ✅ 被清理 | ✅ 被清理 | ✅ 关系被清理（但 memo 残留） |
 | **attachments** | ✅ 被清理 | ✅ 被清理 | ❌ 残留 |
+| **parent_uid** | (已删除) | (已删除) | **NULL（被当成正常 memo）** |
 
-### 8.4 多级评论残留场景
+---
+
+### 9.4 多级评论残留场景（修正后的精确分析）
 
 **前提**：存在三级评论结构
 
 ```
-A (主 memo)
-  ├── B (评论 A)
-  │     └── C (评论 B)
-  │           └── D (评论 C)
-  └── E (评论 A)
+A (主 memo, row_status = NORMAL)
+  ├── B (评论 A, 有 relation (B, A, COMMENT))
+  │     └── C (评论 B, 有 relation (C, B, COMMENT))
+  │           └── D (评论 C, 有 relation (D, C, COMMENT))
+  └── E (评论 A, 有 relation (E, A, COMMENT))
 ```
 
 **关系表**：
@@ -1237,26 +1408,28 @@ A (主 memo)
 
 **删除 A 后的状态**：
 
-| memo | 状态 | 原因 |
-|------|------|------|
-| A | ✅ 已删除 | API.DeleteMemo |
-| B | ✅ 已删除 | Store.DeleteMemo(B) |
-| C | ❌ 残留 | 只删除了 C→B 的关系，没有调用 Store.DeleteMemo(C) |
-| D | ❌ 残留 | 同上，只删除了 D→C 的关系 |
-| E | ✅ 已删除 | Store.DeleteMemo(E) |
+| memo | 本体是否删除 | 关系是否删除 | parent_uid | 被 ListMemos(ExcludeComments=true) 返回 |
+|------|-------------|-------------|-----------|--------------------------------------|
+| A | ✅ 已删除 | ✅ 已删除 | (已删除) | 否 |
+| B | ✅ 已删除 | ✅ 已删除 | (已删除) | 否 |
+| C | ❌ 残留 | ✅ (C,B) 已删除 | **NULL** | **是** |
+| D | ❌ 残留 | ✅ (D,C) 已删除 | **NULL** | **是** |
+| E | ✅ 已删除 | ✅ 已删除 | (已删除) | 否 |
 
-**残留 memo 的特征**：
+**残留 memo C 和 D 的特征**：
 - `row_status` 保持原值（NORMAL 或 ARCHIVED）
 - `memo_relation` 表中没有任何关联（因为 B、C 被删除时清理了关系）
-- 不在任何列表中显示（因为查询需要关系过滤）
-- 但通过直接 URL 或数据库查询仍能访问
-- attachments 和 payload 数据完整保留
+- **`parent_uid = NULL`**（因为 LEFT JOIN memo_relation 找不到匹配）
+- **会被 `ListMemos(ExcludeComments=true)` 返回**（满足 `parent_uid IS NULL`）
+- 会被统计数据计入（TotalMemoCount、TagCount、MemoTypeStats 等）
+- 会出现在 RSS 订阅、MCP 工具查询中
+- 会被其他用户看到（如果 visibility = PUBLIC/PROTECTED）
 
 ---
 
-## 9. 三条路径对比
+## 10. 三条路径对比
 
-### 9.1 操作对比表
+### 10.1 操作对比表
 
 | 维度 | 正常态直删 | 归档 | 归档后恢复 | 归档后删除 |
 |------|-----------|------|-----------|-----------|
@@ -1270,8 +1443,11 @@ A (主 memo)
 | 子评论 Webhook | ❌ 不触发 | 无 | 无 | ❌ 不触发 |
 | 子评论 SSE | ❌ 不广播 | 无 | 无 | ❌ 不广播 |
 | 事务保护 | 无 | 无 | 无 | 无 |
+| 残留 memo 可见性 | **会被当成正常 memo 返回** | 无 | 无 | **会被当成正常 memo 返回** |
 
-### 9.2 事件对比表
+---
+
+### 10.2 事件对比表
 
 | 维度 | 正常态直删 | 归档 | 归档后恢复 | 归档后删除 |
 |------|-----------|------|-----------|-----------|
@@ -1287,9 +1463,9 @@ A (主 memo)
 
 ---
 
-## 10. 失败处理机制汇总
+## 11. 失败处理机制汇总
 
-### 10.1 前端失败处理
+### 11.1 前端失败处理
 
 位置：`web/src/components/MemoActionMenu/hooks.ts:69-74, 102-107`
 
@@ -1325,7 +1501,7 @@ try {
 
 ---
 
-### 10.2 API 层失败处理
+### 11.2 API 层失败处理
 
 位置：`server/router/api/v1/memo_service.go`
 
@@ -1353,7 +1529,7 @@ if err = s.Store.DeleteMemo(ctx, &store.DeleteMemo{ID: memo.ID}); err != nil {
 
 ---
 
-### 10.3 Store 层失败处理
+### 11.3 Store 层失败处理
 
 **无事务保护**：删除和更新操作都是分步执行的：
 
@@ -1370,10 +1546,11 @@ if err = s.Store.DeleteMemo(ctx, &store.DeleteMemo{ID: memo.ID}); err != nil {
 - **已执行的步骤不会回滚**
 - 可能导致部分数据已删除，部分数据残留
 - **多级评论存在残留风险**
+- **残留 memo 可能被当成正常 memo 返回**
 
 ---
 
-### 10.4 Webhook 失败处理
+### 11.4 Webhook 失败处理
 
 位置：`internal/webhook/webhook.go:126-140`
 
@@ -1401,7 +1578,7 @@ func PostAsync(requestPayload *WebhookRequestPayload) {
 
 ---
 
-### 10.5 SSE 失败处理
+### 11.5 SSE 失败处理
 
 位置：`server/router/api/v1/sse_hub.go:115-132`
 
@@ -1431,9 +1608,9 @@ func (h *SSEHub) Broadcast(event *SSEEvent) {
 
 ---
 
-## 11. 关键设计决策分析
+## 12. 关键设计决策分析
 
-### 11.1 状态管理设计
+### 12.1 状态管理设计
 
 **两状态模型**（NORMAL / ARCHIVED）：
 
@@ -1450,7 +1627,7 @@ func (h *SSEHub) Broadcast(event *SSEEvent) {
 
 ---
 
-### 11.2 评论删除非递归设计
+### 12.2 评论删除非递归设计
 
 **当前实现**：
 - 只删除直接评论（RelatedMemoID = 父 ID）
@@ -1469,7 +1646,7 @@ func (h *SSEHub) Broadcast(event *SSEEvent) {
 
 3. **潜在风险**：
    - 多级评论会变成孤立 memo 残留
-   - 但残留的 memo 不会出现在任何列表中
+   - **残留 memo 的关系被清理，parent_uid=NULL，会被当成正常 memo 返回**
 
 **设计意图**：
 - 假设多级评论场景少见
@@ -1477,7 +1654,7 @@ func (h *SSEHub) Broadcast(event *SSEEvent) {
 
 ---
 
-### 11.3 子评论走 Store.DeleteMemo 绕过事件分发
+### 12.3 子评论走 Store.DeleteMemo 绕过事件分发
 
 **当前实现**：
 
@@ -1518,7 +1695,7 @@ for _, relation := range relations {
 
 ---
 
-### 11.4 删除无事务保护
+### 12.4 删除无事务保护
 
 **当前实现**：分步执行，失败不回滚
 
@@ -1527,7 +1704,7 @@ for _, relation := range relations {
   - 评论已删除，主 memo 未删除
   - 部分 attachments 已删除
   - relations 已清理，memo 本体残留
-  - **多级评论残留**
+  - **多级评论残留，且被当成正常 memo 返回**
 
 **设计意图**：
 - 简化实现
@@ -1535,7 +1712,7 @@ for _, relation := range relations {
 
 ---
 
-### 11.5 Webhook 异步设计
+### 12.5 Webhook 异步设计
 
 **当前实现**：
 - 4 个 worker，队列容量 128
@@ -1550,7 +1727,7 @@ for _, relation := range relations {
 
 ---
 
-### 11.6 SSE 静默丢弃设计
+### 12.6 SSE 静默丢弃设计
 
 **当前实现**：
 - 慢客户端丢弃事件
@@ -1563,18 +1740,107 @@ for _, relation := range relations {
 
 ---
 
-## 12. 相关文件索引
+### 12.7 评论判定基于 memo_relation 关系
+
+**当前实现**：
+
+```sql
+-- 评论判定依赖 memo_relation 表的存在
+LEFT JOIN `memo_relation` 
+    ON `memo`.`id` = `memo_relation`.`memo_id` 
+    AND `memo_relation`.`type` = "COMMENT" 
+
+-- 排除评论的条件
+WHERE `parent_uid` IS NULL
+```
+
+**设计意图**：
+- 评论是通过关系表关联的，不是 memo 的固有属性
+- 一个 memo 可以同时是多个 memo 的评论（理论上）
+- 关系删除后，memo 就不再被认为是评论
+
+**潜在问题**：
+- **如果关系被清理但 memo 本体残留，该 memo 会被当成正常 memo 返回**
+- 可能导致原本的评论内容出现在正常列表中
+- 可能导致统计数据异常
+
+---
+
+## 13. 残留 memo 的影响范围汇总（修正后的精确结论）
+
+### 13.1 触发条件
+
+| 条件 | 说明 |
+|------|------|
+| 存在多级评论 | 至少三级：A → B → C（C 是 B 的评论，B 是 A 的评论） |
+| 删除顶层 memo | 删除 A 时触发 B 的删除，B 的删除触发 C→B 关系的清理 |
+| API 层只处理直接评论 | 只递归一层，不处理更深层级 |
+| Store.DeleteMemo 清理关系但不删除关联 memo | 清理 related_memo_id = B 的关系（即 C→B），但不会递归删除 C |
+| ListMemos 使用 ExcludeComments=true | 默认行为，parent_uid=NULL 时满足条件 |
+
+---
+
+### 13.2 影响范围（精确）
+
+| 影响方面 | 精确描述 | 前提条件 |
+|---------|---------|---------|
+| **数据库残留** | 多级评论（三级及以下）的 memo 本体残留，relations 被清理 | 满足上述所有触发条件 |
+| **正常列表可见** | 残留 memo 会出现在首页、时间线等正常 memo 列表中 | `ListMemos(ExcludeComments=true)` 查询 |
+| **用户统计异常** | TotalMemoCount、TagCount、MemoTypeStats 会计入残留 memo | `GetUserStats` 使用 `ExcludeComments=true` |
+| **RSS 订阅** | 残留 memo 会出现在 RSS feed 中 | RSS 使用 `ExcludeComments=true` |
+| **MCP 工具** | 残留 memo 会被 AI 助手查询到 | MCP 工具使用 `ExcludeComments=true` |
+| **直接访问** | 通过 URL 直接访问残留 memo 仍可正常打开 | memo 本体存在，GetMemo 不查关系 |
+| **内容暴露** | 如果残留 memo 是 PUBLIC/PROTECTED，可能被其他用户看到 | 依赖 visibility 设置 |
+| **存储空间** | 残留 memo 的 content、payload、attachments 占用空间 | attachments 未被清理 |
+| **Webhook 外部系统** | 外部系统不会收到残留 memo 的删除通知 | 子评论删除不触发 Webhook |
+
+---
+
+### 13.3 精确的可见性判定逻辑
+
+```
+残留 memo C 的数据库状态：
+├── memo.id = C 的 ID
+├── memo.row_status = NORMAL (或原值)
+├── memo_relation.memo_id = C 的记录 → ❌ 已删除
+└── memo_relation.related_memo_id = C 的记录 → 可能有（如果 C 有自己的评论）
+
+ListMemos 查询时：
+1. LEFT JOIN memo_relation 
+   ON memo.id = memo_relation.memo_id 
+   AND memo_relation.type = "COMMENT"
+   → C 找不到匹配，因为关系已删除
+
+2. 计算 parent_uid:
+   CASE WHEN parent_memo.uid IS NOT NULL 
+        THEN parent_memo.uid 
+        ELSE NULL END
+   → C 的 parent_uid = NULL
+
+3. 过滤条件 (ExcludeComments=true):
+   WHERE parent_uid IS NULL
+   → C 满足条件！
+
+4. 结论：
+   C 会被返回，被当成正常 memo！
+```
+
+---
+
+## 14. 相关文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
 | `store/common.go` | RowStatus 定义 |
 | `store/memo.go` | Store 层 DeleteMemo/UpdateMemo 实现 |
 | `store/memo_relation.go` | MemoRelation 关系模型定义 |
+| `store/db/sqlite/memo.go` | SQLite ListMemos 查询（含 ExcludeComments 逻辑） |
 | `server/router/api/v1/memo_service.go` | API 层 DeleteMemo/UpdateMemo 实现 |
 | `server/router/api/v1/memo_update_helpers.go` | 更新副作用（Webhook+SSE） |
 | `server/router/api/v1/sse_hub.go` | SSE Hub 实现 |
+| `server/router/api/v1/user_service_stats.go` | 用户统计（使用 ExcludeComments=true） |
 | `internal/webhook/webhook.go` | Webhook 异步实现 |
-| `web/src/components/MemoActionMenu/MemoActionMenu.tsx` | 前端操作菜单 UI |
+| `web/src/components/MemoActionMenu/MemoActionMenu.tsx` | 前端操作菜单 UI（isComment 判定） |
 | `web/src/components/MemoActionMenu/hooks.ts` | 前端操作处理逻辑 |
 | `web/src/hooks/useLiveMemoRefresh.ts` | 前端 SSE 监听和缓存处理 |
 | `web/src/pages/Archived.tsx` | 归档页面 |
