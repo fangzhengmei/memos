@@ -123,23 +123,45 @@ QueryClientProvider
 
 **文件**: `web/src/hooks/useMemoQueries.ts:196-250`
 
+以下为**真实实现摘录**（非伪代码）：
+
 ```typescript
 export function useUpdateMemo() {
+  const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: async ({ update, updateMask }) => memoServiceClient.updateMemo(...),
+    mutationFn: async ({ update, updateMask }: { update: Partial<Memo>; updateMask: string[] }) => {
+      const memo = await memoServiceClient.updateMemo({
+        memo: create(MemoSchema, update as Record<string, unknown>),
+        updateMask: create(FieldMaskSchema, { paths: updateMask }),
+      });
+      return memo;
+    },
 
     // 阶段 1: onMutate — API 请求前执行
     onMutate: async ({ update }) => {
+      if (!update.name) {
+        return { previousMemo: undefined };
+      }
+
       await queryClient.cancelQueries({ queryKey: memoKeys.all });  // 取消竞态请求
-      const previousMemo = ...  // 保存快照
-      queryClient.setQueryData(memoKeys.detail(update.name), { ...previousMemo, ...update });  // 乐观更新详情
-      patchMemoInCollectionQueries(queryClient, update);  // 乐观更新所有列表
+
+      const previousMemo =
+        queryClient.getQueryData<Memo>(memoKeys.detail(update.name)) ||
+        findMemoInCollectionQueries(queryClient, update.name);  // 双源查找快照
+      const memoPatch: MemoPatch = { ...update, name: update.name };
+
+      if (previousMemo) {
+        queryClient.setQueryData(memoKeys.detail(update.name), { ...previousMemo, ...memoPatch });
+      }
+      patchMemoInCollectionQueries(queryClient, memoPatch);
+
       return { previousMemo };
     },
 
     // 阶段 2: onError — 失败回滚
     onError: (_err, { update }, context) => {
-      if (context?.previousMemo) {
+      if (context?.previousMemo && update.name) {
         queryClient.setQueryData(memoKeys.detail(update.name), context.previousMemo);
         patchMemoInCollectionQueries(queryClient, context.previousMemo);
       } else {
@@ -149,13 +171,24 @@ export function useUpdateMemo() {
 
     // 阶段 3: onSuccess — 服务端确认
     onSuccess: (updatedMemo) => {
-      queryClient.setQueryData(memoKeys.detail(updatedMemo.name), updatedMemo);
-      patchMemoInCollectionQueries(queryClient, updatedMemo);
-      queryClient.invalidateQueries({ queryKey: memoKeys.lists() });
+      queryClient.setQueryData(memoKeys.detail(updatedMemo.name), updatedMemo);  // 1. 同步详情
+      patchMemoInCollectionQueries(queryClient, updatedMemo);                    // 2. 同步列表
+      queryClient.invalidateQueries({ queryKey: memoKeys.lists() });             // 3. 失效列表触发重取
+      if (updatedMemo.parent) {                                                  // 4. 条件性失效评论
+        queryClient.invalidateQueries({ queryKey: memoKeys.comments(updatedMemo.parent) });
+      }
+      queryClient.invalidateQueries({ queryKey: userKeys.stats() });             // 5. 失效用户统计
     },
   });
 }
 ```
+
+**`onSuccess` 完整 5 步关联失效**（真实实现）：
+1. 用服务端返回数据同步详情缓存
+2. 用服务端返回数据同步所有列表缓存
+3. 触发列表查询失效（确保排序/筛选正确）
+4. 若 memo 有 `parent`（评论场景），失效该父 memo 的评论列表
+5. 失效用户统计缓存
 
 ### 3.3 列表缓存修补机制
 
