@@ -35,9 +35,21 @@ CREATE INDEX IF NOT EXISTS idx_memo_visibility ON memo (visibility);
 CREATE INDEX IF NOT EXISTS idx_resource_creator_id ON resource (creator_id);
 ```
 
-#### 3.1.2 索引优化（v0.26）
+#### 3.1.2 索引删除历史
 
-在 `store/migration/sqlite/0.26/02__drop_indexes.sql` 中删除了部分索引：
+系统在两个版本中删除了索引：
+
+**第一阶段（v0.24）**：在 `store/migration/sqlite/0.24/00__memo.sql` 中删除了以下索引：
+
+```sql
+DROP INDEX IF EXISTS idx_memo_tags;
+DROP INDEX IF EXISTS idx_memo_content;
+DROP INDEX IF EXISTS idx_memo_visibility;
+```
+
+伴随 `ALTER TABLE memo DROP COLUMN tags;`（tags 列被废弃）
+
+**第二阶段（v0.26）**：在 `store/migration/sqlite/0.26/02__drop_indexes.sql` 中删除了以下索引：
 
 ```sql
 DROP INDEX IF EXISTS idx_user_username;
@@ -48,6 +60,8 @@ DROP INDEX IF EXISTS idx_attachment_memo_id;
 
 **优化原因分析**：
 - 系统转向基于 CEL 过滤器的动态查询模式
+- `content.contains()` 使用 `LIKE '%text%'` 导致索引无法使用
+- `payload` 字段查询依赖 `json_extract()` 函数
 - 避免过多索引导致的写入性能下降
 - 依赖数据库查询优化器自动选择合适的执行计划
 
@@ -89,10 +103,17 @@ uid TEXT NOT NULL UNIQUE  -- 唯一索引
 | 主键索引 | `id` | 主键查询 |
 | 唯一索引 | `uid` | 按 UID 查询 |
 
-**注意**：v0.26 迁移删除了以下索引：
-- `idx_memo_creator_id` (creator_id)
-- `idx_memo_content` (content)
-- `idx_memo_visibility` (visibility)
+**索引删除历史（两个阶段）**：
+
+| 删除版本 | 索引名称 | 字段 | 删除原因 |
+|---------|---------|------|---------|
+| v0.24 | `idx_memo_tags` | `tags` | tags 列被废弃，同时删除列和索引 |
+| v0.24 | `idx_memo_content` | `content` | `content.contains()` 使用 `LIKE '%text%'` 无法使用索引 |
+| v0.24 | `idx_memo_visibility` | `visibility` | 与 `OR` 条件组合时索引选择性降低 |
+| v0.26 | `idx_memo_creator_id` | `creator_id` | 权限裁剪使用 `OR` 组合，优化器可能不选择 |
+| v0.26 | `idx_attachment_creator_id` | `attachment.creator_id` | 减少索引维护开销 |
+| v0.26 | `idx_attachment_memo_id` | `attachment.memo_id` | 减少索引维护开销 |
+| v0.26 | `idx_user_username` | `user.username` | 已有唯一约束（UNIQUE），无需额外索引 |
 
 ### 4.2 查询执行路径中的索引使用
 
@@ -1199,13 +1220,23 @@ if currentUser == nil {
 
 ### 12.4 为什么删除了历史索引？
 
-**决策背景**：v0.26 迁移删除了 `idx_memo_creator_id`、`idx_memo_content`、`idx_memo_visibility`
+**决策背景**：索引删除分两个阶段进行：
 
-**可能的考量**：
-1. **写入性能优先**：索引会增加 INSERT/UPDATE/DELETE 的开销
-2. **查询模式变化**：转向 CEL 动态查询，索引选择性降低
-3. **维护成本**：多数据库（SQLite/MySQL/PostgreSQL）索引维护复杂
-4. **依赖优化器**：相信数据库查询优化器能处理小规模数据
+| 阶段 | 版本 | 删除的索引 | 关联改动 |
+|-----|-----|-----------|---------|
+| 第一阶段 | v0.24 | `idx_memo_tags`、`idx_memo_content`、`idx_memo_visibility` | 删除 `tags` 列（`ALTER TABLE memo DROP COLUMN tags`） |
+| 第二阶段 | v0.26 | `idx_memo_creator_id`、`idx_user_username`、`idx_attachment_*` | 无列删除，纯索引优化 |
+
+**v0.24 删除原因**：
+1. **tags 列废弃**：`tags` 列被删除，索引 `idx_memo_tags` 随之删除
+2. **查询模式变化**：`content.contains()` 生成 `LIKE '%text%'`，前导通配符使 B-Tree 索引失效
+3. **函数调用**：使用 `memos_unicode_lower()` 函数，即使有索引也无法使用
+
+**v0.26 删除原因**：
+1. **权限裁剪使用 OR 组合**：`creator_id == X OR visibility IN (...)`，优化器可能不选择单列索引
+2. **已有唯一约束**：`user.username` 已有 `UNIQUE` 约束，无需额外索引
+3. **写入性能优先**：索引会增加 INSERT/UPDATE/DELETE 的开销
+4. **维护成本**：多数据库（SQLite/MySQL/PostgreSQL）索引维护复杂
 
 **潜在风险**：
 - 数据量增长时查询性能会显著下降
@@ -1213,9 +1244,7 @@ if currentUser == nil {
 
 ---
 
-## 十三、性能考虑与优化建议
-
-### 13.1 当前性能瓶颈
+## 十三、1 当前性能瓶颈
 
 | 潜在瓶颈 | 位置 | 严重程度 | 说明 |
 |---------|------|---------|------|
@@ -1359,7 +1388,9 @@ Memos 的搜索功能采用了**分层协作**的架构设计：
 
 **当前状态**：
 - `memo` 表仅有主键（`id`）和唯一索引（`uid`）
-- 历史上的 `creator_id`、`content`、`visibility` 索引已在 v0.26 被删除
+- 索引删除分两个阶段：
+  - **v0.24**：删除 `idx_memo_tags`、`idx_memo_content`、`idx_memo_visibility`（同时删除 `tags` 列）
+  - **v0.26**：删除 `idx_memo_creator_id`、`idx_user_username`、`idx_attachment_*`
 - **所有搜索查询基本都依赖全表扫描**
 
 **索引参与流程**：
