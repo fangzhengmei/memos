@@ -513,20 +513,106 @@ for frontier not empty:
 
 **孤儿评论的特征**：
 - 存在于 `memo` 表中（creator_id、content 等字段完整）
-- 但在 `memo_relation` 表中**没有任何 `type='COMMENT'` 的关系**
-- 通过 `ExcludeComments` 过滤时不会出现（因为 ParentUID 为 NULL）
+- 但在 `memo_relation` 表中**没有任何 `type='COMMENT'` 的关系作为源**
 - 查询该 memo 时，`ParentUID` 为 NULL（因为 JOIN 不到 parent_memo）
+- **通过 `ExcludeComments` 过滤时会被保留**（因为 ParentUID 为 NULL）
 - 实际上变成了一个**普通 memo**，但内容是评论
 
-**如何检测孤儿评论**：
+**ExcludeComments 的实际行为修正**：
+
+代码中 `ExcludeComments = true` 的条件是：
+- SQLite: `WHERE parent_uid IS NULL`
+- MySQL: `HAVING parent_uid IS NULL`
+- PostgreSQL: `WHERE memo_relation.related_memo_id IS NULL`
+
+这意味着：**保留所有没有 COMMENT 关系的 memo**，包括：
+1. 普通 memo（从未是评论）
+2. 孤儿评论（曾是评论，关系边已被删除）
+
+所以孤儿评论会被当作普通 memo 一样**保留**在查询结果中。
+
+**孤儿评论的识别：当前设计的局限性**
+
+在当前数据库设计中，**孤儿评论和普通 memo 在数据状态上是完全相同的**：
+
+| 特征 | 普通 memo | 孤儿评论（嵌套评论残留） |
+|-----|-----------|----------------------|
+| memo 表记录 | 存在 | 存在 |
+| `parent_uid` 查询结果 | NULL | NULL |
+| `memo_relation` 中 COMMENT 关系（作为源） | 无 | 无 |
+| `MemoPayload` 标识 | 无特殊标识 | 无特殊标识 |
+
+**原因**：
+1. 评论的"身份"完全由 `memo_relation` 表中的 `COMMENT` 关系决定
+2. `MemoPayload` 结构体中没有 `is_comment` 或类似的标识字段
+3. 当关系边被删除后，该 memo 就失去了"我是评论"的所有证据
+
+**设计一个相对准确的孤儿评论查询**
+
+虽然无法完美区分，但可以通过排除"明显是普通 memo"的特征来缩小范围：
+
 ```sql
--- 找出所有 memo 表中存在，但没有 COMMENT 关系边的"评论"
--- （假设评论的 visibility 可能是特定值，或者通过其他方式判断）
-SELECT m.id, m.uid, m.content
+-- 找出可能的孤儿评论：没有 COMMENT 关系，且没有普通 memo 的典型特征
+-- 注意：这只是一个启发式查询，可能有误判或漏判
+
+SELECT DISTINCT m.id, m.uid, m.content, m.creator_id, m.created_ts
 FROM memo m
-LEFT JOIN memo_relation mr ON m.id = mr.memo_id AND mr.type = 'COMMENT'
-WHERE mr.memo_id IS NULL;
+
+-- 1. 排除：有 COMMENT 关系（即仍然是正常评论）
+LEFT JOIN memo_relation mr_source ON m.id = mr_source.memo_id AND mr_source.type = 'COMMENT'
+
+-- 2. 排除：被其他 memo 评论（即作为父 memo 存在，通常是普通 memo）
+LEFT JOIN memo_relation mr_target ON m.id = mr_target.related_memo_id AND mr_target.type = 'COMMENT'
+
+-- 3. 排除：有 REFERENCE 关系（作为源或目标）
+LEFT JOIN memo_relation mr_ref_source ON m.id = mr_ref_source.memo_id AND mr_ref_source.type = 'REFERENCE'
+LEFT JOIN memo_relation mr_ref_target ON m.id = mr_ref_target.related_memo_id AND mr_ref_target.type = 'REFERENCE'
+
+WHERE
+  -- 没有 COMMENT 关系作为源（可能是孤儿评论或普通 memo）
+  mr_source.memo_id IS NULL
+  -- 排除：被其他 memo 评论的（通常是普通 memo）
+  AND mr_target.related_memo_id IS NULL
+  -- 排除：有 REFERENCE 关系的（通常是普通 memo）
+  AND mr_ref_source.memo_id IS NULL
+  AND mr_ref_target.related_memo_id IS NULL
+  -- 可选：排除有标签的 memo（需要解析 payload JSON）
+  -- AND JSON_EXTRACT(m.payload, '$.tags') IS NULL
+  -- 可选：排除有位置信息的 memo
+  -- AND JSON_EXTRACT(m.payload, '$.location') IS NULL
+ORDER BY m.created_ts DESC;
 ```
+
+**这个查询的逻辑**：
+1. 找出所有没有 COMMENT 关系的 memo（第一步筛选）
+2. 排除那些被其他 memo 评论的 memo（通常是普通 memo，不是评论）
+3. 排除那些有 REFERENCE 关系的 memo（通常是普通 memo）
+4. 剩下的就是"可能的孤儿评论"
+
+**局限性**：
+- 仍然可能误判：没有被评论、没有引用关系的普通 memo 也会被选中
+- 可能漏判：被其他 memo 评论的孤儿评论不会被选中
+- 这只是一个启发式方法，不是准确的识别
+
+**可靠检测孤儿评论的改进方案**：
+
+要在设计层面解决这个问题，需要修改数据模型：
+
+1. **在 MemoPayload 中添加 `is_comment` 标志**：
+   ```protobuf
+   message MemoPayload {
+     bool is_comment = 4;  // 创建评论时设置为 true
+     // ... 其他字段
+   }
+   ```
+   这样即使关系边被删除，仍能识别这是评论
+
+2. **添加软删除机制**：
+   - 关系删除时记录 `deleted_ts` 而不是物理删除
+   - 可以查询"曾经有 COMMENT 关系但现在被删除"的 memo
+
+3. **使用数据库审计/日志**：
+   - 但这超出了应用层范围
 
 #### 5.3.6 设计意图与权衡
 
@@ -534,16 +620,29 @@ WHERE mr.memo_id IS NULL;
 - 简单直接：删除一个 memo，同时删除它的直接评论
 - 假设：用户不会有深层嵌套的评论，或者残留不是严重问题
 - 性能：避免递归查询的开销
+- **潜在问题**：嵌套评论（评论的评论）会变成孤儿
 
 **DeleteUserCompletely 的设计意图**：
 - 彻底清理：用户注销时需要完全删除所有数据
 - 合规要求：GDPR 等法规要求"被遗忘权"
-- 使用图遍历确保没有遗漏
+- 使用图遍历（WITH RECURSIVE / BFS）确保没有遗漏
+
+**设计对比总结**：
+
+| 维度 | DeleteMemo | DeleteUserCompletely |
+|-----|-----------|---------------------|
+| **设计目标** | 快速删除单个 memo | 彻底删除用户所有数据 |
+| **嵌套评论处理** | 不处理，可能残留 | 递归收集，完全删除 |
+| **残留风险** | 有（嵌套评论变成孤儿） | 无 |
+| **复杂度** | 简单（一层循环） | 复杂（图遍历 + 事务） |
+| **适用场景** | 日常内容管理 | 用户注销、数据清理 |
 
 **可能的改进方向**：
-- 让 DeleteMemo 也使用递归方式收集所有子孙评论
-- 或者在 Store 层实现级联删除触发器
-- 但这会增加复杂度和性能开销
+1. **让 DeleteMemo 也使用递归方式**：参考 `DeleteUserCompletely` 的图遍历逻辑
+2. **在 MemoPayload 中添加评论标识**：即使关系边丢失，仍能识别这是评论
+3. **数据库级联删除**：使用外键约束和 `ON DELETE CASCADE`，但需要注意：
+   - 当前设计使用 `UNIQUE` 约束而非外键
+   - 级联删除只能删除关系边，不能自动删除评论 memo（因为评论是独立 memo）
 
 #### 5.2.4 查询环节
 
@@ -785,6 +884,20 @@ DeleteMemo (API层)
 | `server/router/mcp/tools_relation.go` | MCP 关系工具 | AI 助手可调用的关系操作 |
 
 ## 10. 修订记录
+
+- **v4 (2026-05-11)**：修正 ExcludeComments 过滤行为和孤儿评论检测
+  - **重大修正**：更正 ExcludeComments 的过滤行为说明
+    - SQLite: `WHERE parent_uid IS NULL` 实际过滤的是 `parent_memo.uid` 为 NULL
+    - MySQL: `HAVING parent_uid IS NULL` 使用 HAVING 过滤计算字段
+    - PostgreSQL: `WHERE memo_relation.related_memo_id IS NULL` 直接过滤 JOIN 条件
+    - 三者逻辑等价：保留所有没有 COMMENT 关系的 memo
+  - **重要更正**：`ExcludeComments` 会把孤儿评论当作普通 memo 一样保留
+  - **删除错误内容**：移除了之前错误的"检测孤儿评论"SQL（会把所有普通 memo 误判）
+  - **新增分析**：说明孤儿评论和普通 memo 在当前设计下无法区分的原因
+    - 评论身份完全由 `memo_relation` 关系决定
+    - `MemoPayload` 中没有 `is_comment` 标识
+    - 关系边删除后，评论身份证据丢失
+  - **补充改进建议**：如何才能可靠检测孤儿评论
 
 - **v3 (2026-05-11)**：深入分析删除环节的嵌套评论处理
   - 新增 **5.3 两条删除路径的嵌套评论处理差异** 章节
